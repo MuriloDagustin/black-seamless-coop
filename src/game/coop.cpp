@@ -51,6 +51,7 @@ constexpr uint32_t kPlayerCrouch = 0x3A1;
 constexpr uint32_t kGame = 0x2D45F0;
 constexpr uint32_t kGameState = 0x21070;     // the game's current state
 constexpr uint32_t kInLevelState = 0x20F78;  // the in-level state: current in play and in its pause menu
+constexpr uint32_t kFailedState = 0x2103C, kCompleteState = 0x2104C;  // its sub-states once the play is over
 constexpr uint32_t kWorldUnit = 0x5AF0;
 constexpr uint32_t kUnitSlots = 0x49D0, kUnitSlotSize = 0x880;  // +8 the unit held, +0x38 activated
 constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
@@ -66,7 +67,7 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 14;
+constexpr uint16_t kProtocol = 15;
 enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap, kDiscover, kOffer };
 
 #pragma pack(push, 1)
@@ -96,7 +97,8 @@ struct State {
     uint8_t unit;         // its current unit (world+0x5AF0), in or out of play
     uint8_t next_active;  // and the next one activated there
     uint8_t waiting;      // the unit its advance waits for this copy to reach (world::WaitingUnit), 0 none
-    uint8_t in_mission;   // its in-level state is the game's (game+0x21070): in play, paused, a hint, a cinematic
+    uint8_t in_mission;   // it plays this mission: its in-level state is the game's (in play, paused, a hint, a
+                          // cinematic), not on its failed or complete page (a play that is over)
     float view[4][3];  // right, up, forward, eye
     float feet[3];     // the body, player+0xA0: where the triggers test the player
     float yaw, pitch;
@@ -159,6 +161,7 @@ struct PathPoint {
     float feet[3];
     int8_t level;
     uint8_t reach;  // the farthest unit the partner could stand in then: its current one or the one it waits for
+    uint8_t load;   // the partner's level load it was in: points of a play before are not walked any more
 };
 constexpr uint64_t kPathSize = 256;
 PathPoint g_path[kPathSize];
@@ -217,7 +220,9 @@ void Sample(State& s, uint64_t now) {
         }
         s.waiting = world::WaitingUnit();
         uint32_t game = R32(kGame);
-        s.in_mission = game && R32(game + kGameState) == game + kInLevelState;
+        uint32_t sub = game ? R32(game + kInLevelState + 0x08) : 0;  // its sub-state (0x20EB60)
+        s.in_mission = game && R32(game + kGameState) == game + kInLevelState && sub != game + kFailedState &&
+                       sub != game + kCompleteState;
         uint32_t stream = R32(world + 0x5AE8);  // an advance under way (1, then 3 at 0x1F1143): its unit is the next one
         if (stream == 1 || stream == 3) s.waiting = std::max<uint8_t>(s.waiting, uint8_t(s.unit + 1));
     }
@@ -313,6 +318,7 @@ void Receive(uint64_t now) {
                         std::memcpy(pp.feet, in.state.feet, sizeof pp.feet);
                         pp.level = in.state.level;
                         pp.reach = std::max(in.state.unit, in.state.waiting);
+                        pp.load = in.state.load;
                         g_path_count++;
                     }
                     shots::Acked(in.state.shot_ack);
@@ -541,13 +547,15 @@ uint32_t Rescues() { return g_rescues; }
 namespace {
 
 // a place the partner stood a moment ago, a step or more from it: walked on, not in a wall, in a unit this copy has
-// (the partner's reach then at least the unit)
+// (the partner's reach then at least the unit), in the partner's present play. When it stood still, its farthest
+// step of that walk, nearer than a step
 bool TrailPoint(const float partner[3], int8_t level, uint8_t unit, float out[3]) {
     constexpr float kNear = 1.2f, kFar = 6.0f;
     uint64_t first = g_path_count > kPathSize ? g_path_count - kPathSize : 0;
+    float best = -1;
     for (uint64_t k = g_path_count; k-- > first;) {
         const PathPoint& p = g_path[k % kPathSize];
-        if (p.level != level || p.reach < unit) break;
+        if (p.level != level || p.load != g_remote.load || p.reach < unit) break;
         float d[3] = {p.feet[0] - partner[0], p.feet[1] - partner[1], p.feet[2] - partner[2]};
         float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (dist > kFar) break;
@@ -555,8 +563,18 @@ bool TrailPoint(const float partner[3], int8_t level, uint8_t unit, float out[3]
             std::memcpy(out, p.feet, 12);
             return true;
         }
+        if (dist > best) best = dist, std::memcpy(out, p.feet, 12);
     }
-    return false;
+    return best >= 0;
+}
+
+// the partner's newest place on its walk in this play past that unit, for a partner whose world is stopped
+bool LastPlace(int8_t level, uint8_t unit, float out[3]) {
+    if (!g_path_count) return false;
+    const PathPoint& p = g_path[(g_path_count - 1) % kPathSize];
+    if (p.level != level || p.load != g_remote.load || p.reach < unit) return false;
+    std::memcpy(out, p.feet, 12);
+    return true;
 }
 
 }  // namespace
@@ -568,22 +586,14 @@ bool PlaceByPartner(uint8_t unit) {
     int8_t level = G<int8_t>(world + kWorldLevel);
     float partner[3];
     bool at = PartnerAt(partner);
-    if (!at && PartnerInLevel() && g_path_count) {  // stopped (its world waits): where it was last
-        const PathPoint& p = g_path[(g_path_count - 1) % kPathSize];
-        if (p.level == level) std::memcpy(partner, p.feet, 12), at = true;
-    }
+    if (!at && PartnerInLevel()) at = LastPlace(level, unit, partner);  // stopped (its world waits): where it was last
     if (!at) {
         LOGR("coop: get me out of here: the partner is not in this level");
         return false;
     }
     float to[3];
-    if (!TrailPoint(partner, level, unit, to)) {
-        // standing still a while: beside it, across its view (not back over a trigger it came through)
-        const float* f = g_remote_play.view[kRowForward];
-        float h = std::sqrt(f[0] * f[0] + f[2] * f[2]);
-        std::memcpy(to, partner, 12);
-        if (h > 0.01f) to[0] += f[2] / h * 0.8f, to[2] -= f[0] / h * 0.8f;
-    }
+    // no step of its walk: where it stands (no guess beside it, which may be a wall or back over a trigger)
+    if (!TrailPoint(partner, level, unit, to)) std::memcpy(to, partner, 12);
     uint32_t player = world + kWorldPlayer;
     float* feet = &G<float>(player + kPlayerFeet);
     float* last = &G<float>(world + kWorldLastPos);
