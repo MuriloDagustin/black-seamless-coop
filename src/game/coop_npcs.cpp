@@ -119,8 +119,7 @@ constexpr uint32_t kPoolTypes = 0x7A20;  // the character types of 0x40, +0 thei
 constexpr uint32_t kBodyName = 0xC0FFEE00, kBodyNameHi = 0x00C00B0D;
 constexpr uint32_t kBodyTypes[] = {0x1E, 0x1D, 0x1F, 0x25};  // the squad mates, a soldier: the first loaded
 constexpr uint64_t kBodyRetryMs = 2000;
-constexpr uint64_t kBodyGoneMs = 3000;      // the partner gone from this level that long: its body let go
-constexpr uint64_t kBodyPausedMs = 30000;   // paused in it (a hint, its menu) that long: let go too
+constexpr uint64_t kBodyGoneMs = 3000;  // the partner gone from this level that long (not paused in it): let go
 constexpr float kBodyRun = 6.5f;
 uint32_t g_body = 0;
 uint32_t g_body_src = 0, g_body_sub = 0;
@@ -253,8 +252,9 @@ void BodyTick(X86Context& ctx) {
     float feet[3];
     bool here = coop::PartnerFeet(feet);
     if (g_body && !BodyAlive()) g_body = 0;
+    if (coop::PartnerInLevel()) g_body_seen = now;  // paused in it too: its body stands where it was
     if (!here) {
-        if (g_body && now - g_body_seen > (coop::PartnerInLevel() ? kBodyPausedMs : kBodyGoneMs)) ReleaseBody(ctx);
+        if (g_body && now - g_body_seen > kBodyGoneMs) ReleaseBody(ctx);
         g_body_prev_at = 0;
         g_body_rate = 0;  // it stands
         return;
@@ -638,7 +638,8 @@ X86_FUNC(sub_001AD440) {
     uint32_t ai = R32(kAi);
     uint32_t perception = R32(ctx.esp + 4);
     uint32_t slot = 0;
-    if (g_host && g_bodies && ai && BodyAlive()) {
+    float feet[3];
+    if (g_host && g_bodies && ai && BodyAlive() && coop::PartnerFeet(feet)) {  // a paused partner is not a target
         bool in = false;
         for (uint32_t i = 0; i < 4; i++) {
             uint32_t at = ai + kAiSquad + i * 4, who = R32(at);

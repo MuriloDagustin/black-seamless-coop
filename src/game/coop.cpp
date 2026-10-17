@@ -48,6 +48,9 @@ constexpr uint32_t kPlayerFeet = 0xA0;  // the body's position, the last row of 
 constexpr uint32_t kRowEye = 3;
 constexpr uint32_t kRowForward = 2;
 constexpr uint32_t kPlayerCrouch = 0x3A1;
+constexpr uint32_t kGame = 0x2D45F0;
+constexpr uint32_t kGameState = 0x21070;     // the game's current state
+constexpr uint32_t kInLevelState = 0x20F78;  // the in-level state: current in play and in its pause menu
 constexpr uint32_t kWorldUnit = 0x5AF0;
 constexpr uint32_t kUnitSlots = 0x49D0, kUnitSlotSize = 0x880;  // +8 the unit held, +0x38 activated
 constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
@@ -63,7 +66,7 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 12;
+constexpr uint16_t kProtocol = 13;
 enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap };
 
 #pragma pack(push, 1)
@@ -88,6 +91,7 @@ struct State {
     uint8_t unit;         // its current unit (world+0x5AF0), in or out of play
     uint8_t next_active;  // and the next one activated there
     uint8_t waiting;      // the unit its advance waits for this copy to reach (world::WaitingUnit), 0 none
+    uint8_t in_mission;   // its in-level state is the game's (game+0x21070): in play, paused, a hint, a cinematic
     float view[4][3];  // right, up, forward, eye
     float feet[3];     // the body, player+0xA0: where the triggers test the player
     float yaw, pitch;
@@ -130,9 +134,7 @@ uint64_t g_last_rx = 0, g_last_tx = 0, g_last_hello = 0;
 State g_remote{};
 std::atomic<bool> g_rescue{false};
 uint32_t g_rescues = 0;
-uint64_t g_remote_play_at = 0;  // when the partner's state last said it was in play
-State g_remote_play{};          // its last state in play: its view and place while it is paused
-constexpr uint64_t kAwayMs = 60000;  // out of play that long (its menus): not in the level any more
+State g_remote_play{};  // its last state in play: its view and place while it is paused
 State g_local{};
 // the partner's walk as it came, for the triggers: each state of its in a level, oldest dropped
 struct PathPoint {
@@ -196,6 +198,8 @@ void Sample(State& s, uint64_t now) {
             if (R32(slot + 8) == s.unit + 1u && G<uint8_t>(slot + 0x38)) s.next_active = 1;
         }
         s.waiting = world::WaitingUnit();
+        uint32_t game = R32(kGame);
+        s.in_mission = game && R32(game + kGameState) == game + kInLevelState;
         uint32_t stream = R32(world + 0x5AE8);  // an advance under way (1, then 3 at 0x1F1143): its unit is the next one
         if (stream == 1 || stream == 3) s.waiting = std::max<uint8_t>(s.waiting, uint8_t(s.unit + 1));
     }
@@ -250,7 +254,7 @@ void Receive(uint64_t now) {
             case kState:
                 if (n == int(sizeof(State)) && Finite(in.state) && int32_t(in.h.seq - g_rx_seq) > 0) {
                     g_remote = in.state;
-                    if (g_remote.in_level) g_remote_play_at = now, g_remote_play = g_remote;
+                    if (g_remote.in_level) g_remote_play = g_remote;
                     g_rx_seq = in.h.seq;
                     if (in.state.in_level) {
                         PathPoint& pp = g_path[g_path_count % kPathSize];
@@ -416,8 +420,9 @@ bool PartnerInLevel() {
     uint32_t world = R32(kWorld);
     uint64_t now = NowMs();
     return g_net && world && now - g_last_rx <= kTimeoutMs && g_remote.load_level == G<int8_t>(world + kWorldLevel) &&
-           (g_remote.in_level || now - g_remote_play_at < kAwayMs);
+           (g_remote.in_level || g_remote.in_mission);
 }
+bool PartnerPaused() { return PartnerInLevel() && !g_remote.in_level; }
 bool PartnerAt(float out[3]) {
     uint32_t world = R32(kWorld);
     if (!g_net || !world || !g_remote.in_level || NowMs() - g_last_rx > kTimeoutMs) return false;
@@ -605,12 +610,15 @@ void LatchCamera() {
 
 bool RemoteMarker(Marker& m) {
     uint32_t world = R32(kWorld);
-    if (!world || !Live() || !g_remote.in_level || NowMs() - g_last_rx > kTimeoutMs) return false;
-    if (g_remote.level != G<int8_t>(world + kWorldLevel)) return false;
+    if (!world || !Live()) return false;
+    bool paused = PartnerPaused();  // in its pause menu, a hint, its failed page: where it was last
+    if (!paused && (!g_remote.in_level || NowMs() - g_last_rx > kTimeoutMs)) return false;
+    const State& from = paused ? g_remote_play : g_remote;
+    if (!from.in_level || from.level != G<int8_t>(world + kWorldLevel)) return false;
     static float shown[3];
     static uint64_t at;
     uint64_t now = NowMs();
-    const float* target = g_remote.view[kRowEye];
+    const float* target = from.view[kRowEye];
     float d2 = 0;
     for (int i = 0; i < 3; i++) d2 += (target[i] - shown[i]) * (target[i] - shown[i]);
     float k = at && d2 < kSnap * kSnap ? 1 - std::exp(-float(now - at) / kSmoothMs) : 1;
@@ -620,7 +628,9 @@ bool RemoteMarker(Marker& m) {
     const float* eye = LocalEye();
     float d[3] = {shown[0] - eye[0], shown[1] - eye[1], shown[2] - eye[2]};
     float distance = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    const char* fmt = m.on_screen ? "P2 %.0f" : m.x < game::Aspect() * 240 ? "< P2 %.0f" : "P2 %.0f >";
+    const char* fmt = m.on_screen                    ? (paused ? "P2 %.0f PAUSED" : "P2 %.0f")
+                      : m.x < game::Aspect() * 240 ? (paused ? "< P2 %.0f PAUSED" : "< P2 %.0f")
+                                                   : (paused ? "P2 %.0f PAUSED >" : "P2 %.0f >");
     std::snprintf(m.text, sizeof m.text, fmt, double(distance));
     return true;
 }
@@ -643,7 +653,7 @@ const char* Status() {
     else if (!g_have_peer) std::snprintf(s, sizeof s, "COOP HOST %u WAITING", g_cfg.port);
     else if (now - g_last_rx > kTimeoutMs) std::snprintf(s, sizeof s, "COOP NO PARTNER");
     else if (world::WaitingForPartner()) std::snprintf(s, sizeof s, "COOP WAITING FOR P2");
-    else if (!g_remote.in_level) std::snprintf(s, sizeof s, "COOP P2 IN MENUS");
+    else if (!g_remote.in_level) std::snprintf(s, sizeof s, g_remote.in_mission ? "COOP P2 PAUSED" : "COOP P2 IN MENUS");
     else std::snprintf(s, sizeof s, "COOP P2 LEVEL %d", int(g_remote.level));
     return s;
 }

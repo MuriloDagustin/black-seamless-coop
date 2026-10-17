@@ -20,6 +20,7 @@ void LatchCamera();    // the scene camera's view and projection are the device'
 bool PartnerFeet(float out[3]);  // the partner's body in this level, in play and heard from of late
 bool PartnerInLevel();           // heard from of late, its last load this level: in play or paused in it a while
 bool PartnerAt(float out[3]);    // the partner in play in this level, this copy's world stopped or not
+bool PartnerPaused();            // in this level, out of play (its pause menu, a hint, a page)
 // "get me out of here": this copy's player put next to the partner, on the way the partner came. Asked from any
 // thread (F8, a controller's two stick clicks held a second, the test channel); done at the next frame
 void AskRescue();
