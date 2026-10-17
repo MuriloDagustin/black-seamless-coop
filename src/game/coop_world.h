@@ -8,6 +8,7 @@
 #include "kernel/kernel.h"
 
 namespace coop::world {
+void Stop(X86Context& ctx);
 
 // stage 0: off; 1: deaths; 2: and the partner fires triggers; 3: and props and projectiles
 void SetMode(bool net, int stage);

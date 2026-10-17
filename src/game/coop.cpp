@@ -51,6 +51,7 @@ constexpr uint32_t kPlayerCrouch = 0x3A1;
 constexpr uint32_t kGame = 0x2D45F0;
 constexpr uint32_t kGameState = 0x21070;     // the game's current state
 constexpr uint32_t kInLevelState = 0x20F78;  // the in-level state: current in play and in its pause menu
+constexpr uint32_t kFailedState = 0x2103C, kCompleteState = 0x2104C;  // its sub-states once the play is over
 constexpr uint32_t kWorldUnit = 0x5AF0;
 constexpr uint32_t kUnitSlots = 0x49D0, kUnitSlotSize = 0x880;  // +8 the unit held, +0x38 activated
 constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
@@ -66,8 +67,8 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 13;
-enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap };
+constexpr uint16_t kProtocol = 15;
+enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap, kDiscover, kOffer };
 
 #pragma pack(push, 1)
 struct Header {
@@ -81,6 +82,11 @@ struct Hello {
     Header h;
     char xbe_sha1[40];
 };
+struct Offer {
+    Hello hello;
+    char name[64];
+    uint8_t busy;
+};
 struct State {
     Header h;
     uint8_t in_level;
@@ -91,7 +97,8 @@ struct State {
     uint8_t unit;         // its current unit (world+0x5AF0), in or out of play
     uint8_t next_active;  // and the next one activated there
     uint8_t waiting;      // the unit its advance waits for this copy to reach (world::WaitingUnit), 0 none
-    uint8_t in_mission;   // its in-level state is the game's (game+0x21070): in play, paused, a hint, a cinematic
+    uint8_t in_mission;   // it plays this mission: its in-level state is the game's (in play, paused, a hint, a
+                          // cinematic), not on its failed or complete page (a play that is over)
     float view[4][3];  // right, up, forward, eye
     float feet[3];     // the body, player+0xA0: where the triggers test the player
     float yaw, pitch;
@@ -123,7 +130,20 @@ struct Config {
     bool probe = false;
 } g_cfg;
 
-bool g_net = false;
+std::atomic<bool> g_net{false};
+std::atomic<bool> g_command{false}, g_searching{false};
+std::mutex g_ui_mutex;
+Session g_ui;
+enum class Command { None, Start, Stop, Search };
+struct Request {
+    Command command = Command::None;
+    Role role = Role::Off;
+    std::string host;
+    uint16_t port = 45410;
+} g_request;
+int g_world_stage = 6;
+uint64_t g_search_until = 0, g_search_tx = 0;
+uint16_t g_search_port = 45410;
 bool g_have_peer = false;
 bool g_welcomed = false;
 bool g_sim_seen = false;
@@ -141,6 +161,7 @@ struct PathPoint {
     float feet[3];
     int8_t level;
     uint8_t reach;  // the farthest unit the partner could stand in then: its current one or the one it waits for
+    uint8_t load;   // the partner's level load it was in: points of a play before are not walked any more
 };
 constexpr uint64_t kPathSize = 256;
 PathPoint g_path[kPathSize];
@@ -199,7 +220,9 @@ void Sample(State& s, uint64_t now) {
         }
         s.waiting = world::WaitingUnit();
         uint32_t game = R32(kGame);
-        s.in_mission = game && R32(game + kGameState) == game + kInLevelState;
+        uint32_t sub = game ? R32(game + kInLevelState + 0x08) : 0;  // its sub-state (0x20EB60)
+        s.in_mission = game && R32(game + kGameState) == game + kInLevelState && sub != game + kFailedState &&
+                       sub != game + kCompleteState;
         uint32_t stream = R32(world + 0x5AE8);  // an advance under way (1, then 3 at 0x1F1143): its unit is the next one
         if (stream == 1 || stream == 3) s.waiting = std::max<uint8_t>(s.waiting, uint8_t(s.unit + 1));
     }
@@ -219,6 +242,40 @@ void Receive(uint64_t now) {
     net::Peer from;
     for (int i = 0, n; i < 256 && (n = net::Receive(from, &in, sizeof in)) >= 0; i++) {
         if (n < int(sizeof(Header)) || in.h.magic != kMagic || in.h.protocol != kProtocol) continue;
+        if (in.h.type == kDiscover) {
+            if (!g_net || g_cfg.role != Role::Host || n != sizeof(Hello) ||
+                std::memcmp(in.hello.xbe_sha1, kImageSha1, 40)) continue;
+            Offer offer{};
+            offer.hello.h = Make(kOffer, now);
+            std::memcpy(offer.hello.xbe_sha1, kImageSha1, 40);
+            std::snprintf(offer.name, sizeof offer.name, "%s", net::HostName().c_str());
+            offer.busy = g_have_peer && now - g_last_rx < kTimeoutMs;
+            net::Send(from, &offer, sizeof offer);
+            continue;
+        }
+        if (in.h.type == kOffer) {
+            if (!g_searching || n != sizeof(Offer) || std::memcmp(in.hello.xbe_sha1, kImageSha1, 40)) continue;
+            Offer offer;
+            std::memcpy(&offer, in.raw, sizeof offer);
+            offer.name[sizeof offer.name - 1] = 0;
+            for (char& c : offer.name) if (c && (uint8_t(c) < 32 || uint8_t(c) > 126)) c = '?';
+            std::string address = net::Text(from);
+            address.resize(address.find(':'));
+            std::lock_guard lock(g_ui_mutex);
+            auto it = std::find_if(g_ui.servers.begin(), g_ui.servers.end(), [&](const Server& s) {
+                return s.session == offer.hello.h.session && s.port == from.port;
+            });
+            Server server{address, offer.name, from.port, offer.busy != 0, offer.hello.h.session};
+            // One host can answer through several adapters. Prefer loopback for
+            // copies on this PC, and show a single row for the session.
+            if (it != g_ui.servers.end()) {
+                if (it->address == "127.0.0.1") server.address = it->address;
+                *it = server;
+            }
+            else if (g_ui.servers.size() < 32) g_ui.servers.push_back(server);
+            continue;
+        }
+        if (!g_net) continue;
         bool known = g_have_peer && from == g_peer;
         // the host takes one partner, a new one once the last has gone quiet
         if (g_cfg.role == Role::Host && !known) {
@@ -261,6 +318,7 @@ void Receive(uint64_t now) {
                         std::memcpy(pp.feet, in.state.feet, sizeof pp.feet);
                         pp.level = in.state.level;
                         pp.reach = std::max(in.state.unit, in.state.waiting);
+                        pp.load = in.state.load;
                         g_path_count++;
                     }
                     shots::Acked(in.state.shot_ack);
@@ -385,7 +443,31 @@ const float* LocalEye() { return &G<float>(R32(kWorld) + kWorldPlayer + kPlayerV
 
 }  // namespace
 
-bool Active() { return g_net || g_cfg.echo || g_cfg.probe || control::Enabled(); }
+bool Active() { return g_net || g_command || g_searching || g_cfg.echo || g_cfg.probe || control::Enabled(); }
+
+Session GetSession() {
+    std::lock_guard lock(g_ui_mutex);
+    Session s = g_ui;
+    s.pending = g_command;
+    s.searching = g_searching;
+    return s;
+}
+
+void RequestStart(Role role, const std::string& host, uint16_t port) {
+    std::lock_guard lock(g_ui_mutex);
+    g_request = {Command::Start, role, host, port};
+    g_command = true;
+}
+void RequestStop() {
+    std::lock_guard lock(g_ui_mutex);
+    g_request.command = Command::Stop;
+    g_command = true;
+}
+void RequestSearch(uint16_t port) {
+    std::lock_guard lock(g_ui_mutex);
+    g_request = {Command::Search, Role::Off, {}, port};
+    g_command = true;
+}
 
 bool InPlay() { return Live(); }
 
@@ -465,13 +547,15 @@ uint32_t Rescues() { return g_rescues; }
 namespace {
 
 // a place the partner stood a moment ago, a step or more from it: walked on, not in a wall, in a unit this copy has
-// (the partner's reach then at least the unit)
+// (the partner's reach then at least the unit), in the partner's present play. When it stood still, its farthest
+// step of that walk, nearer than a step
 bool TrailPoint(const float partner[3], int8_t level, uint8_t unit, float out[3]) {
     constexpr float kNear = 1.2f, kFar = 6.0f;
     uint64_t first = g_path_count > kPathSize ? g_path_count - kPathSize : 0;
+    float best = -1;
     for (uint64_t k = g_path_count; k-- > first;) {
         const PathPoint& p = g_path[k % kPathSize];
-        if (p.level != level || p.reach < unit) break;
+        if (p.level != level || p.load != g_remote.load || p.reach < unit) break;
         float d[3] = {p.feet[0] - partner[0], p.feet[1] - partner[1], p.feet[2] - partner[2]};
         float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (dist > kFar) break;
@@ -479,8 +563,18 @@ bool TrailPoint(const float partner[3], int8_t level, uint8_t unit, float out[3]
             std::memcpy(out, p.feet, 12);
             return true;
         }
+        if (dist > best) best = dist, std::memcpy(out, p.feet, 12);
     }
-    return false;
+    return best >= 0;
+}
+
+// the partner's newest place on its walk in this play past that unit, for a partner whose world is stopped
+bool LastPlace(int8_t level, uint8_t unit, float out[3]) {
+    if (!g_path_count) return false;
+    const PathPoint& p = g_path[(g_path_count - 1) % kPathSize];
+    if (p.level != level || p.load != g_remote.load || p.reach < unit) return false;
+    std::memcpy(out, p.feet, 12);
+    return true;
 }
 
 }  // namespace
@@ -492,22 +586,14 @@ bool PlaceByPartner(uint8_t unit) {
     int8_t level = G<int8_t>(world + kWorldLevel);
     float partner[3];
     bool at = PartnerAt(partner);
-    if (!at && PartnerInLevel() && g_path_count) {  // stopped (its world waits): where it was last
-        const PathPoint& p = g_path[(g_path_count - 1) % kPathSize];
-        if (p.level == level) std::memcpy(partner, p.feet, 12), at = true;
-    }
+    if (!at && PartnerInLevel()) at = LastPlace(level, unit, partner);  // stopped (its world waits): where it was last
     if (!at) {
         LOGR("coop: get me out of here: the partner is not in this level");
         return false;
     }
     float to[3];
-    if (!TrailPoint(partner, level, unit, to)) {
-        // standing still a while: beside it, across its view (not back over a trigger it came through)
-        const float* f = g_remote_play.view[kRowForward];
-        float h = std::sqrt(f[0] * f[0] + f[2] * f[2]);
-        std::memcpy(to, partner, 12);
-        if (h > 0.01f) to[0] += f[2] / h * 0.8f, to[2] -= f[0] / h * 0.8f;
-    }
+    // no step of its walk: where it stands (no guess beside it, which may be a wall or back over a trigger)
+    if (!TrailPoint(partner, level, unit, to)) std::memcpy(to, partner, 12);
     uint32_t player = world + kWorldPlayer;
     float* feet = &G<float>(player + kPlayerFeet);
     float* last = &G<float>(world + kWorldLastPos);
@@ -522,11 +608,76 @@ bool PlaceByPartner(uint8_t unit) {
     return true;
 }
 
+namespace {
+
+void PublishSession(const std::string& error = {}) {
+    std::lock_guard lock(g_ui_mutex);
+    g_ui.role = g_net ? g_cfg.role : Role::Off;
+    g_ui.running = g_net;
+    g_ui.port = g_cfg.port;
+    g_ui.status = Status();
+    if (!error.empty()) g_ui.error = error;
+}
+
+void StartSession() {
+    if (g_cfg.role == Role::Off) return;
+    if (!net::Open(g_cfg.role == Role::Host ? g_cfg.port : 0)) {
+        PublishSession("Could not open UDP port " + std::to_string(g_cfg.port) + ". Check whether it is already in use.");
+        return;
+    }
+    if (g_cfg.role == Role::Join) {
+        g_peer = {net::Resolve(g_cfg.host), g_cfg.port};
+        if (!g_peer.addr) {
+            net::Close();
+            PublishSession("Host address not found: " + g_cfg.host);
+            return;
+        }
+        g_have_peer = true;
+    }
+    g_cfg.echo = false;
+    g_net = true;
+    shots::SetMode(true, false);
+    world::SetMode(true, g_world_stage);
+    npcs::SetMode(g_cfg.role == Role::Host && g_world_stage >= 4, g_cfg.role == Role::Join && g_world_stage >= 4,
+                  g_world_stage >= 5);
+    LOGR("coop: world sync stage %d", g_world_stage);
+    if (g_cfg.role == Role::Host) LOGR("coop: host on UDP %u", g_cfg.port);
+    else LOGR("coop: joining %s", net::Text(g_peer).c_str());
+    PublishSession();
+}
+
+void StopSession(X86Context& ctx) {
+    if (g_net && g_have_peer) {
+        Header bye = Make(kBye, NowMs());
+        net::Send(g_peer, &bye, sizeof bye);
+    }
+    npcs::Stop(ctx);
+    world::Stop(ctx);
+    shots::Reset();
+    shots::SetMode(false, false);
+    net::Close();
+    g_net = false;
+    g_searching = false;
+    g_cfg.role = Role::Off;
+    g_cfg.echo = false;
+    g_have_peer = g_welcomed = false;
+    g_peer = {};
+    g_remote = {}, g_remote_play = {};
+    g_peer_session = g_seq = g_rx_seq = 0;
+    g_last_rx = g_last_tx = g_last_hello = 0;
+    g_path_count = 0;
+    g_echo.clear();
+    g_rescue = false;
+    LOGR("coop: session stopped");
+}
+
+}  // namespace
+
 void Init() {
     g_session = std::random_device{}() | 1;  // never 0, the value before any partner
     const game::Options& o = game::Opt();
     g_cfg.role = Role(std::min(o.coop, 2u));
-    g_cfg.port = uint16_t(o.coop_port ? o.coop_port : 45410);
+    g_cfg.port = uint16_t(o.coop_port && o.coop_port <= 65535 ? o.coop_port : 45410);
     {
         std::lock_guard<std::recursive_mutex> ui(app::UiLock());
         g_cfg.host = app::Get().join_ip;
@@ -535,7 +686,8 @@ void Init() {
     std::string v;
     if (net::Arg("--coop", v)) g_cfg.role = v == "host" ? Role::Host : v == "join" ? Role::Join : Role::Off;
     if (net::Arg("--join", v) && !v.empty()) g_cfg.host = v;
-    if (net::Arg("--coop-port", v) && std::atoi(v.c_str()) > 0) g_cfg.port = uint16_t(std::atoi(v.c_str()));
+    if (net::Arg("--coop-port", v) && std::atoi(v.c_str()) > 0 && std::atoi(v.c_str()) <= 65535)
+        g_cfg.port = uint16_t(std::atoi(v.c_str()));
     g_cfg.echo = net::Arg("--coop-echo", v);
     g_cfg.probe = net::Arg("--coop-probe", v);
     if (g_cfg.echo || g_cfg.probe) LOGR("coop:%s%s", g_cfg.echo ? " echo" : "", g_cfg.probe ? " probe" : "");
@@ -547,31 +699,58 @@ void Init() {
     world::SetMode(false, 0);
     // --coop-world 5: no level flow; 4: no partner's body; 3: no host enemies; 2: deaths and triggers; 1: deaths
     // only; 0: no world sync
-    int world_stage = 6;
-    if (net::Arg("--coop-world", v) && !v.empty()) world_stage = std::atoi(v.c_str());
-    if (g_cfg.role == Role::Off) return;
-    if (!net::Open(g_cfg.role == Role::Host ? g_cfg.port : 0)) return;  // WSAStartup, before any name lookup
-    if (g_cfg.role == Role::Join) {
-        g_peer = {net::Resolve(g_cfg.host), g_cfg.port};
-        if (!g_peer.addr) {
-            LOGE("coop: join address '%s' not found", g_cfg.host.c_str());
-            return;
-        }
-        g_have_peer = true;
-    }
-    g_cfg.echo = false;  // a partner instead
-    g_net = true;
-    shots::SetMode(true, false);
-    world::SetMode(true, world_stage);
-    npcs::SetMode(g_cfg.role == Role::Host && world_stage >= 4, g_cfg.role == Role::Join && world_stage >= 4,
-                  world_stage >= 5);
-    LOGR("coop: world sync stage %d", world_stage);
-    if (g_cfg.role == Role::Host) LOGR("coop: host on UDP %u", g_cfg.port);
-    else LOGR("coop: joining %s", net::Text(g_peer).c_str());
+    if (net::Arg("--coop-world", v) && !v.empty()) g_world_stage = std::atoi(v.c_str());
+    StartSession();
+    PublishSession();
 }
 
-void BeginFrame() {
-    if (g_net) Receive(NowMs());
+void BeginFrame(X86Context& ctx) {
+    uint64_t now = NowMs();
+    if (g_command) {
+        Request request;
+        {
+            std::lock_guard lock(g_ui_mutex);
+            request = g_request;
+            g_request = {};
+            g_command = false;
+            g_ui.error.clear();
+        }
+        if (request.command == Command::Start || request.command == Command::Stop) {
+            StopSession(ctx);
+            if (request.command == Command::Start && request.port &&
+                (request.role == Role::Host || request.role == Role::Join)) {
+                g_session = std::random_device{}() | 1;
+                g_cfg.role = request.role;
+                g_cfg.host = request.host;
+                g_cfg.port = request.port;
+                StartSession();
+            }
+        } else if (request.command == Command::Search) {
+            if (!g_net && !net::Open(0)) PublishSession("Could not open a socket for LAN search.");
+            else {
+                g_search_port = request.port;
+                g_search_until = now + 3000;
+                g_search_tx = 0;
+                g_searching = true;
+                std::lock_guard lock(g_ui_mutex);
+                g_ui.servers.clear();
+            }
+        }
+    }
+    if (g_net || g_searching) Receive(now);
+    if (g_searching) {
+        if (now >= g_search_until) {
+            g_searching = false;
+            if (!g_net) net::Close();
+        } else if (!g_search_tx || now - g_search_tx >= 500) {
+            Hello query{Make(kDiscover, now), {}};
+            std::memcpy(query.xbe_sha1, kImageSha1, 40);
+            net::Send({0xFFFFFFFFu, g_search_port}, &query, sizeof query);
+            net::Send({net::Resolve("127.0.0.1"), g_search_port}, &query, sizeof query);
+            g_search_tx = now;
+        }
+    }
+    PublishSession();
 }
 
 void Control(X86Context& ctx) { control::Poll(ctx); }
@@ -649,7 +828,8 @@ bool ProbeMarker(Marker& m) {
 const char* Status() {
     static char s[32];
     uint64_t now = NowMs();
-    if (!g_net) std::snprintf(s, sizeof s, g_cfg.echo ? "COOP ECHO" : g_cfg.probe ? "COOP PROBE" : "COOP CONTROL");
+    if (!g_net) std::snprintf(s, sizeof s, g_cfg.echo ? "COOP ECHO" : g_cfg.probe ? "COOP PROBE" :
+                                           control::Enabled() ? "COOP CONTROL" : "COOP OFF");
     else if (!g_have_peer) std::snprintf(s, sizeof s, "COOP HOST %u WAITING", g_cfg.port);
     else if (now - g_last_rx > kTimeoutMs) std::snprintf(s, sizeof s, "COOP NO PARTNER");
     else if (world::WaitingForPartner()) std::snprintf(s, sizeof s, "COOP WAITING FOR P2");
@@ -684,7 +864,7 @@ int ProbeLines(char (*lines)[32], int max) {
 X86_EXTERN_FUNC(__imp__sub_0020F6A0);
 X86_FUNC(sub_0020F6A0) {
     if (!coop::Active()) return __imp__sub_0020F6A0(ctx, base);
-    coop::BeginFrame();
+    coop::BeginFrame(ctx);
     coop::world::FlowTick(ctx);  // the world stopped or not
     if (coop::g_rescue.exchange(false)) coop::world::AskRescue();  // its steps in FlowTick
     coop::Control(ctx);  // test commands; the game object stays in eax, hle calls put registers back

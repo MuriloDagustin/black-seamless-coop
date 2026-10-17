@@ -368,6 +368,17 @@ void SetMode(bool host, bool puppets, bool body) {
     g_bodies = body;
 }
 
+void Stop(X86Context& ctx) {
+    // Give enemies their physics back before releasing ownership.
+    Living([](uint32_t ch) {
+        if (g_puppets && !IsBody(ch) && R32(ch + kCharTeam) != 0)
+            G<uint8_t>(ch + kCharKinematic) = 0;
+    });
+    ReleaseBody(ctx);
+    SetMode(false, false, false);
+    LevelReset();
+}
+
 int Snapshot(uint8_t* out, int cap, int& bytes) {
     bytes = 0;
     if (!g_host || !R32(kWorld)) return 0;
@@ -522,6 +533,10 @@ void LevelReset() {
     g_body = 0;  // the level's characters are gone with it
     g_body_prev_at = 0;
     g_body_tried = 0;
+    g_body_seen = 0;
+    g_body_rate = 0;
+    g_body_dir[0] = g_body_dir[1] = 0;
+    g_body_dir[2] = 1;
     g_state.clear();
     g_absent.clear();
     g_died.clear();
@@ -558,6 +573,21 @@ X86_FUNC(sub_001E5F70) {
         return Return(ctx, ctx.eax, 0);
     }
     __imp__sub_001E5F70(ctx, base);
+}
+
+// The locomotion selector reads BOTH controller+0x84 and character+0x2D8 (0x17AC80).
+// 0x1DFD90 measures the latter before our network placement, so a kinematic puppet
+// with no local displacement measures zero. Supply its network speed at the point
+// the animation consumes it, without giving it local physics or AI movement.
+X86_EXTERN_FUNC(__imp__sub_0017E280);
+X86_FUNC(sub_0017E280) {
+    uint32_t ch = R32(ctx.esi);
+    if ((IsBody(ch) && BodyAlive()) || HostOwned(ch)) {
+        uint32_t ctl = R32(ch + kCharControl);
+        float speed = ctl ? G<float>(ctl + kControlRate) : 0.0f;
+        G<float>(ch + 0x2D8) = std::isfinite(speed) ? std::clamp(speed, 0.0f, kBodyRun) : 0.0f;
+    }
+    __imp__sub_0017E280(ctx, base);
 }
 
 // The characters' update (esi the pool; dt; ret 4): then each puppet is put where the host's is

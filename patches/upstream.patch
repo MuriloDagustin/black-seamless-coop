@@ -120,6 +120,133 @@ index d839025..52324da 100644
      .load = game::Load,
      .save = game::Save,
      .init = game::Init,
+diff --git a/src/common/menu.cpp b/src/common/menu.cpp
+index f5cc7c0..3921999 100644
+--- a/src/common/menu.cpp
++++ b/src/common/menu.cpp
+@@ -29,6 +29,7 @@
+ #include "common/mouse_keyboard.h"
+ #include "common/options.h"
+ #include "common/translations.h"
++#include "game/coop.h"
+ 
+ namespace app {
+ 
+@@ -502,9 +503,10 @@ std::string KeyText(std::string keys) {
+     return keys;
+ }
+ 
+-const char* const kPages[] = {"RECOMP SETTINGS", "MOUSE AND KEYBOARD"};
++const char* const kPages[] = {"RECOMP SETTINGS", "MOUSE AND KEYBOARD", "CO-OP"};
+ constexpr int kSettingsPage = 0;
+ constexpr int kKeyboardPage = 1;
++constexpr int kCoopPage = 2;
+ 
+ void RestoreDefaults(int page) {
+     game::Options& o = game::Opt();
+@@ -653,7 +655,84 @@ void KeyRow(const Row& r) {
+     g_capture_armed = false;
+ }
+ 
++void DrawCoop() {
++    coop::Session session = coop::GetSession();
++    static char address[128]{};
++    static int port = 0;
++    if (!port) {
++        std::snprintf(address, sizeof address, "%s", Get().join_ip.c_str());
++        port = int(session.port);
++    }
++    Section("CO-OP");
++    ImGui::TextUnformatted(session.status.c_str());
++    if (session.running) ImGui::TextUnformatted(session.role == coop::Role::Host ? "Hosting" : "Partner");
++    if (!session.error.empty()) ImGui::TextWrapped("%s", session.error.c_str());
++    ImGui::Spacing();
++    ImGui::BeginDisabled(session.running || session.pending);
++    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
++    ImGui::InputInt("UDP port", &port, 0);
++    bool valid_port = port > 0 && port <= 65535;
++    auto save = [&](coop::Role role, const std::string& host) {
++        game::Opt().coop = uint32_t(role);
++        game::Opt().coop_port = uint32_t(port);
++        Get().join_ip = host;
++        Save();
++    };
++    ImGui::BeginDisabled(!valid_port);
++    if (ImGui::Button("Host server")) {
++        save(coop::Role::Host, address);
++        coop::RequestStart(coop::Role::Host, {}, uint16_t(port));
++    }
++    ImGui::SameLine();
++    ImGui::BeginDisabled(session.searching);
++    if (ImGui::Button("Find LAN servers")) coop::RequestSearch(uint16_t(port));
++    ImGui::EndDisabled();
++    ImGui::Spacing();
++    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20);
++    ImGui::InputText("Host IP / name", address, sizeof address);
++    ImGui::BeginDisabled(!address[0]);
++    if (ImGui::Button("Join by address")) {
++        save(coop::Role::Join, address);
++        coop::RequestStart(coop::Role::Join, address, uint16_t(port));
++    }
++    ImGui::EndDisabled();
++    ImGui::EndDisabled();
++    Section("LAN SERVERS");
++    if (session.searching) ImGui::TextUnformatted("Searching...");
++    else if (session.servers.empty()) ImGui::TextWrapped("Find servers on this network using the UDP port above.");
++    for (const auto& server : session.servers) {
++        std::string endpoint = server.address + ":" + std::to_string(server.port);
++        ImGui::PushID(endpoint.c_str());
++        ImGui::Text("%s  %s", server.name.c_str(), endpoint.c_str());
++        ImGui::SameLine();
++        ImGui::BeginDisabled(server.busy);
++        if (ImGui::Button(server.busy ? "Full" : "Join")) {
++            port = server.port;
++            std::snprintf(address, sizeof address, "%s", server.address.c_str());
++            save(coop::Role::Join, server.address);
++            coop::RequestStart(coop::Role::Join, server.address, server.port);
++        }
++        ImGui::EndDisabled();
++        ImGui::PopID();
++    }
++    ImGui::EndDisabled();
++    if (!valid_port) ImGui::TextUnformatted("Enter a port from 1 to 65535.");
++    ImGui::Spacing();
++    ImGui::BeginDisabled(session.pending || (!session.running && !session.searching));
++    if (ImGui::Button("Leave / stop server")) {
++        game::Opt().coop = 0;
++        Save();
++        coop::RequestStop();
++    }
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("Two players. Load the same mission on both copies. F8 brings you to your partner.");
++}
++
+ void DrawRows(int page) {
++    if (page == kCoopPage) {
++        DrawCoop();
++        return;
++    }
+     size_t count = 0;
+     const Row* list = rows::Page(page, &count);
+     for (size_t i = 0; i < count; i++) {
+@@ -665,6 +744,7 @@ void DrawRows(int page) {
+ }
+ 
+ void Defaults() {
++    if (g_page == kCoopPage) return;
+     g_capture = -1;
+     if (g_page == kSettingsPage) g_display_held = false;
+     RestoreDefaults(g_page);
+@@ -723,7 +803,9 @@ void DrawFooter(float em) {
+     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(buttons_pad, 0.0f));
+     if (ImGui::Button(Ui("Back", false).c_str(), ImVec2(bw, 0))) ToggleMenu();
+     ImGui::SameLine();
++    ImGui::BeginDisabled(g_page == kCoopPage);
+     if (ImGui::Button(Ui("Defaults", false).c_str(), ImVec2(bw, 0))) Defaults();
++    ImGui::EndDisabled();
+     ImGui::SameLine();
+     ImGui::BeginDisabled(!g_display_held);
+     if (ImGui::Button(Ui("Apply", false).c_str(), ImVec2(bw, 0))) Apply();
 diff --git a/src/common/mouse_keyboard.cpp b/src/common/mouse_keyboard.cpp
 index 0039bd1..1f5108e 100644
 --- a/src/common/mouse_keyboard.cpp
