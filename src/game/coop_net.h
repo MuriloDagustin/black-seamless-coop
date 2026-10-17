@@ -20,4 +20,9 @@ std::string Text(const Peer& p);          // a.b.c.d:port
 bool Arg(const char* name, std::string& value);
 bool Foreground();  // the game window is the one in front
 
+// the test control channel's own socket, on 127.0.0.1 only
+bool OpenControl(uint16_t port);
+int ReceiveControl(Peer& from, void* p, int n);  // as Receive
+bool SendControl(const Peer& to, const void* p, int n);
+
 }  // namespace coop::net

@@ -112,4 +112,50 @@ bool Arg(const char* name, std::string& value) {
 
 bool Foreground() { return GetForegroundWindow() == static_cast<HWND>(app::Window()); }
 
+namespace {
+SOCKET g_control = INVALID_SOCKET;
+}
+
+bool OpenControl(uint16_t port) {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+    g_control = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_control == INVALID_SOCKET) return false;
+    u_long on = 1;
+    ::ioctlsocket(g_control, FIONBIO, &on);
+    BOOL off = FALSE;
+    DWORD bytes = 0;
+    WSAIoctl(g_control, kUdpConnReset, &off, sizeof off, nullptr, 0, &bytes, nullptr, nullptr);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(g_control, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
+        LOGE("coop: control channel bind of UDP %u failed (%d)", port, WSAGetLastError());
+        ::closesocket(g_control);
+        g_control = INVALID_SOCKET;
+        return false;
+    }
+    return true;
+}
+
+int ReceiveControl(Peer& from, void* p, int n) {
+    if (g_control == INVALID_SOCKET) return -1;
+    sockaddr_in a{};
+    int len = sizeof a;
+    int r = ::recvfrom(g_control, static_cast<char*>(p), n, 0, reinterpret_cast<sockaddr*>(&a), &len);
+    if (r == SOCKET_ERROR) return WSAGetLastError() == WSAEWOULDBLOCK ? -1 : 0;
+    from = {a.sin_addr.s_addr, ntohs(a.sin_port)};
+    return r;
+}
+
+bool SendControl(const Peer& to, const void* p, int n) {
+    if (g_control == INVALID_SOCKET) return false;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(to.port);
+    a.sin_addr.s_addr = to.addr;
+    return ::sendto(g_control, static_cast<const char*>(p), n, 0, reinterpret_cast<sockaddr*>(&a), sizeof a) == n;
+}
+
 }  // namespace coop::net

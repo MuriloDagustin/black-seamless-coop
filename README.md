@@ -21,6 +21,7 @@ versions this mod was made with, and puts the mod on top. You need your own copy
 | Partner bullets | the partner's shots are fired again on your copy through the game's own bullet code: impacts, decals, glass, destruction and damage to enemies, with a tracer. They never hit you or touch your ammo or HUD |
 | Enemy deaths | an enemy killed on one copy dies on the other, ragdoll and scripts included |
 | Triggers | one-shot area triggers (enemy waves, scripted scenes) fire for either player's position |
+| Test channel | `--coop-control`: a local text channel that drives a copy without its window's focus (pad, aim, teleport, state), for automated two-copy tests |
 
 Not yet: the partner's body, the gunshot sound and muzzle flash, grenades and rockets, enemies
 moved by the host, props destroyed in sync, level flow (area changes, level end) for both players.
@@ -72,6 +73,15 @@ BLACK.exe --instance 2 --coop join --join 127.0.0.1 --mute
 | `--mute` | no sound |
 | `--coop-probe` | on-screen readout: position, shot and world event counters |
 | `--coop-echo` | alone: your own position and shots come back 3 s later, to see the partner side work |
+| `--coop-control [port]` | test channel on 127.0.0.1 (45500 + instance): this copy plays the pad it is sent and reads no mouse, keyboard or controller |
+
+### Test channel
+
+One command per UDP datagram, one reply each: `ping`, `state`, `npcs`, `page`, `triggers [all]`,
+`pad <a,b,x,y,lt,rt,up,down,left,right,start,back,...> [ms]`, `hold <names>`, `stick <lx> <ly> <rx> <ry> [ms]`,
+`release`, `yaw`/`pitch`/`turn <deg>`, `aim <x> <y> <z>` / `aim nearest` / `aim off`,
+`teleport <x> <y> <z>` / `teleport partner`, `stand <trigger> [frames]`, `peek`/`peekf <addr> [n]`,
+`pokef <addr> <floats>`, `log <text>`. Addresses take `@player+hex` and `@world+hex`.
 
 `black.toml` also takes `coop = 1` (host) or `2` (join) to make a role the default.
 

@@ -20,40 +20,42 @@ index ec16f14..a5b910d 100644
      if (FAILED(out.xa->CreateSourceVoice(&out.voice, &wf.Format))) return std::nullopt;
      ApplyMatrix(out);
 diff --git a/src/common/focus_pause.cpp b/src/common/focus_pause.cpp
-index 4cf9854..0ece468 100644
+index 4cf9854..45fb2f2 100644
 --- a/src/common/focus_pause.cpp
 +++ b/src/common/focus_pause.cpp
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,8 @@
  #include "audio/output.h"
  #include "common/options.h"
  #include "core/log.h"
 +#include "game/coop.h"
++#include "game/coop_control.h"
  
  namespace game {
  
-@@ -28,7 +29,8 @@ bool Unfocused() {
+@@ -28,7 +30,8 @@ bool Unfocused() {
  }  // namespace
  
  void WaitWhileUnfocused() {
 -    if (!Opt().pause_on_focus_loss || !Unfocused()) return;
-+    // the partner waits on this copy's packets: in the background it plays on
-+    if (!Opt().pause_on_focus_loss || coop::Networked() || !Unfocused()) return;
++    // the partner waits on this copy's packets, a test on its control channel: in the background it plays on
++    if (!Opt().pause_on_focus_loss || coop::Networked() || coop::control::Enabled() || !Unfocused()) return;
      LOGI("focus lost: paused");
      g_focus_paused = true;
      audio::SetPaused(true);
 diff --git a/src/common/game_info.cpp b/src/common/game_info.cpp
-index d839025..58459d2 100644
+index d839025..78659d0 100644
 --- a/src/common/game_info.cpp
 +++ b/src/common/game_info.cpp
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,8 @@
  #include "common/monitor.h"
  #include "common/mouse_keyboard.h"
  #include "common/options.h"
 +#include "game/coop.h"
++#include "game/coop_control.h"
  
  namespace game {
  
-@@ -84,8 +85,22 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+@@ -84,8 +86,23 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
      return false;
  }
  
@@ -64,6 +66,7 @@ index d839025..58459d2 100644
 +
  // port 0 has the keyboard; the game sees no input while the panel is open
  void Pad(int port, input::Pad& pad) {
++    if (coop::control::Override(port, pad)) return;  // a test copy plays the control channel's pad
 +    if (CoopBackground()) {
 +        // the keyboard's poll still sees the window inactive: the click that brings it in front is not taken
 +        if (port == 0) {
@@ -76,7 +79,7 @@ index d839025..58459d2 100644
      input::SeenPad(pad);
      if (port == 0) pad.connected = true;
      if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
-@@ -94,6 +109,11 @@ void Pad(int port, input::Pad& pad) {
+@@ -94,6 +111,11 @@ void Pad(int port, input::Pad& pad) {
  
  // no vibration while the keyboard and mouse are in use
  void Rumble(int port, uint16_t& left, uint16_t& right) {
@@ -88,7 +91,7 @@ index d839025..58459d2 100644
      if (port != 0 || !input::KeyboardActive()) return;
      left = 0;
      right = 0;
-@@ -118,6 +138,7 @@ void Init() {
+@@ -118,6 +140,7 @@ void Init() {
      BootLanguage();  // latched before the panel can change the setting
      input::LoadBindings();
      audio::SetOutputMode(Opt().audio_output);
@@ -96,7 +99,7 @@ index d839025..58459d2 100644
  }
  
  void Save(void* table) {
-@@ -170,7 +191,9 @@ const app::GameInfo app::kGame = {
+@@ -170,7 +193,9 @@ const app::GameInfo app::kGame = {
                  {"draw_distance", nullptr, &game::Opt().draw_distance},
                  {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
                  {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
@@ -107,6 +110,39 @@ index d839025..58459d2 100644
      .load = game::Load,
      .save = game::Save,
      .init = game::Init,
+diff --git a/src/common/mouse_keyboard.cpp b/src/common/mouse_keyboard.cpp
+index 0039bd1..1f5108e 100644
+--- a/src/common/mouse_keyboard.cpp
++++ b/src/common/mouse_keyboard.cpp
+@@ -24,6 +24,7 @@
+ #include "common/aspect.h"
+ #include "common/menu.h"
+ #include "common/options.h"
++#include "game/coop_control.h"
+ 
+ namespace input {
+ 
+@@ -232,7 +233,8 @@ std::string Join(const std::vector<int>& vks, bool labels = false) {
+ }
+ 
+ bool Foreground() { return g_hwnd && GetForegroundWindow() == g_hwnd; }
+-bool Active() { return Foreground() && !app::MenuOpen(); }
++// a copy on the test control channel plays its pad only: no mouse, no keyboard, in front or not
++bool Active() { return Foreground() && !app::MenuOpen() && !coop::control::Enabled(); }
+ bool Wheel(int vk) { return vk == kWheelUp || vk == kWheelDown; }
+ bool Down(int vk) {
+     if (Wheel(vk)) return NowMs() - g_wheel_ms[vk == kWheelDown] < kTapMs;
+@@ -421,8 +423,8 @@ void SetMenu(bool menu) {
+     if (g_menu.exchange(menu) != menu) RefreshCursor();
+ }
+ 
+-bool KeyboardActive() { return g_keyboard; }
+-bool CursorShown() { return g_menu && g_keyboard; }
++bool KeyboardActive() { return g_keyboard && !coop::control::Enabled(); }
++bool CursorShown() { return g_menu && KeyboardActive(); }
+ 
+ bool Cursor(float& x, float& y, bool& down) {
+     POINT p;
 diff --git a/src/common/options.h b/src/common/options.h
 index 8c56e8b..fd64c46 100644
 --- a/src/common/options.h

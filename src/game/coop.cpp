@@ -18,6 +18,7 @@
 #include "common/options.h"
 #include "core/log.h"
 #include "game/coop.h"
+#include "game/coop_control.h"
 #include "game/coop_net.h"
 #include "game/coop_shots.h"
 #include "game/coop_world.h"
@@ -320,7 +321,11 @@ const float* LocalEye() { return &G<float>(R32(kWorld) + kWorldPlayer + kPlayerV
 
 }  // namespace
 
-bool Active() { return g_net || g_cfg.echo || g_cfg.probe; }
+bool Active() { return g_net || g_cfg.echo || g_cfg.probe || control::Enabled(); }
+
+bool InPlay() { return Live(); }
+
+const float* PartnerForward() { return g_remote.view[kRowForward]; }
 
 bool PartnerFeet(float out[3]) {
     uint32_t world = R32(kWorld);
@@ -348,6 +353,10 @@ void Init() {
     g_cfg.echo = net::Arg("--coop-echo", v);
     g_cfg.probe = net::Arg("--coop-probe", v);
     if (g_cfg.echo || g_cfg.probe) LOGR("coop:%s%s", g_cfg.echo ? " echo" : "", g_cfg.probe ? " probe" : "");
+    if (net::Arg("--coop-control", v)) {
+        int port = std::atoi(v.c_str());
+        control::Init(uint16_t(port > 0 ? port : 45500 + app::Instance()));
+    }
     shots::SetMode(false, g_cfg.echo);
     world::SetMode(false, 0);
     int world_stage = 2;  // --coop-world 1: deaths only; 0: no world sync
@@ -374,6 +383,8 @@ void Init() {
 void BeginFrame() {
     if (g_net) Receive(NowMs());
 }
+
+void Control(X86Context& ctx) { control::Poll(ctx); }
 
 void EndFrame() {
     uint64_t now = NowMs();
@@ -443,7 +454,7 @@ bool ProbeMarker(Marker& m) {
 const char* Status() {
     static char s[32];
     uint64_t now = NowMs();
-    if (!g_net) std::snprintf(s, sizeof s, g_cfg.echo ? "COOP ECHO" : "COOP PROBE");
+    if (!g_net) std::snprintf(s, sizeof s, g_cfg.echo ? "COOP ECHO" : g_cfg.probe ? "COOP PROBE" : "COOP CONTROL");
     else if (!g_have_peer) std::snprintf(s, sizeof s, "COOP HOST %u WAITING", g_cfg.port);
     else if (now - g_last_rx > kTimeoutMs) std::snprintf(s, sizeof s, "COOP NO PARTNER");
     else if (!g_remote.in_level) std::snprintf(s, sizeof s, "COOP P2 IN MENUS");
@@ -478,6 +489,7 @@ X86_EXTERN_FUNC(__imp__sub_0020F6A0);
 X86_FUNC(sub_0020F6A0) {
     if (!coop::Active()) return __imp__sub_0020F6A0(ctx, base);
     coop::BeginFrame();
+    coop::Control(ctx);  // test commands; the game object stays in eax, hle calls put registers back
     __imp__sub_0020F6A0(ctx, base);
     coop::EndFrame();
 }

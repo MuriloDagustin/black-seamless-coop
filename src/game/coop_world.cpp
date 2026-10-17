@@ -19,6 +19,7 @@
 
 #include "core/log.h"
 #include "game/coop.h"
+#include "game/coop_control.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
@@ -56,6 +57,7 @@ constexpr uint32_t kTriggerTest = 0x48;        // vf18: ecx the trigger; &pos, a
 constexpr uint32_t kTriggerArmed = 0x11C;      // byte
 constexpr uint32_t kTriggerMode = 0x120;       // 0 one shot, 1 2 enter exit, 3 continuous, 4 visibility
 constexpr uint32_t kTriggerAction = 0x124;     // 0 Fire, 1 activate the next unit, 2 advance the unit
+constexpr float kWalkMax = 3.0f;               // farther between two of the partner's tests is a jump
 
 constexpr uint32_t kDie = 0x205C60;  // eax noise class; mgr, victim, part, &dir, dmg, instigator; ret 0x18
 constexpr uint32_t kDeathMgr = 0x2D19B0;
@@ -406,7 +408,10 @@ void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
         have_prev = false;
         return;
     }
-    if (!have_prev) std::memcpy(prev, feet, sizeof prev);
+    // a jump (a teleport, a respawn, packets lost a while) is no walk: only where the partner is now is tested
+    float moved = 0;
+    for (int i = 0; i < 3; i++) moved += (feet[i] - prev[i]) * (feet[i] - prev[i]);
+    if (!have_prev || moved > kWalkMax * kWalkMax) std::memcpy(prev, feet, sizeof prev);
     static uint32_t pos = 0, saved = 0;
     if (!pos) {
         pos = mem::AllocSystem(16, 16);
@@ -509,6 +514,7 @@ X86_FUNC(sub_001DA1A0) {
 X86_EXTERN_FUNC(__imp__sub_001E7FF0);
 X86_FUNC(sub_001E7FF0) {
     uint32_t mgr = ctx.esi;
+    coop::control::BeforeTriggers();  // a test's "stand": the player in a trigger as the triggers are tested
     __imp__sub_001E7FF0(ctx, base);
     PartnerTriggers(ctx, mgr);
 }
