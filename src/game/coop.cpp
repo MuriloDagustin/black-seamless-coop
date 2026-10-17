@@ -3,6 +3,7 @@
 // two the world space view hooks.cpp also reads. The camera's view and projection are the device copies that
 // D3DDevice_SetTransform keeps, set by the camera begin update 0x2B830 before the scene draws.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -46,6 +47,7 @@ constexpr uint32_t kPlayerView = 0xD0;  // right, up, forward, eye
 constexpr uint32_t kPlayerFeet = 0xA0;  // the body's position, the last row of its matrix
 constexpr uint32_t kRowEye = 3;
 constexpr uint32_t kRowForward = 2;
+constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
 constexpr uint32_t kTransformView = 0;  // XDK transform types
 constexpr uint32_t kTransformProjection = 1;
 
@@ -119,6 +121,11 @@ uint32_t g_session = 0, g_peer_session = 0;
 uint32_t g_seq = 0, g_rx_seq = 0, g_sim_frame = 0;
 uint64_t g_last_rx = 0, g_last_tx = 0, g_last_hello = 0;
 State g_remote{};
+std::atomic<bool> g_rescue{false};
+uint32_t g_rescues = 0;
+uint64_t g_remote_play_at = 0;  // when the partner's state last said it was in play
+State g_remote_play{};          // its last state in play: its view and place while it is paused
+constexpr uint64_t kAwayMs = 60000;  // out of play that long (its menus): not in the level any more
 State g_local{};
 // the partner's walk as it came, for the triggers: each state of its in a level, oldest dropped
 struct PathPoint {
@@ -206,7 +213,7 @@ void Receive(uint64_t now) {
         if (in.h.session != g_peer_session) {  // the partner started again: a new sequence, nothing of the old one
             g_peer_session = in.h.session;
             g_rx_seq = 0;
-            g_remote = {};
+            g_remote = {}, g_remote_play = {};
             shots::Reset();
             world::Reset();
         }
@@ -224,6 +231,7 @@ void Receive(uint64_t now) {
             case kState:
                 if (n == int(sizeof(State)) && Finite(in.state) && int32_t(in.h.seq - g_rx_seq) > 0) {
                     g_remote = in.state;
+                    if (g_remote.in_level) g_remote_play_at = now, g_remote_play = g_remote;
                     g_rx_seq = in.h.seq;
                     if (in.state.in_level) {
                         PathPoint& pp = g_path[g_path_count % kPathSize];
@@ -260,7 +268,7 @@ void Receive(uint64_t now) {
                 break;
             case kBye:
                 LOGR("coop: partner %s left", net::Text(g_peer).c_str());
-                g_remote = {};
+                g_remote = {}, g_remote_play = {};
                 g_welcomed = false;
                 if (g_cfg.role == Role::Host) g_have_peer = false;
                 break;
@@ -328,6 +336,7 @@ void Echo(uint64_t now) {
     while (g_echo.size() > 1 && now - g_echo[1].at >= kEchoMs) g_echo.pop_front();
     if (now - g_echo.front().at >= kEchoMs) {
         g_remote = g_echo.front().state;
+        if (g_remote.in_level) g_remote_play = g_remote;
         g_last_rx = now;
     }
 }
@@ -373,7 +382,7 @@ int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap) {
 
 uint64_t PartnerPathEnd() { return g_path_count; }
 
-const float* PartnerForward() { return g_remote.view[kRowForward]; }
+const float* PartnerForward() { return g_remote_play.view[kRowForward]; }
 
 bool PartnerFeet(float out[3]) {
     uint32_t world = R32(kWorld);
@@ -384,10 +393,100 @@ bool PartnerFeet(float out[3]) {
 }
 bool PartnerInLevel() {
     uint32_t world = R32(kWorld);
-    return g_net && world && Live() && NowMs() - g_last_rx <= kTimeoutMs && g_remote.level == G<int8_t>(world + kWorldLevel);
+    uint64_t now = NowMs();
+    return g_net && world && now - g_last_rx <= kTimeoutMs && g_remote.load_level == G<int8_t>(world + kWorldLevel) &&
+           (g_remote.in_level || now - g_remote_play_at < kAwayMs);
+}
+bool PartnerAt(float out[3]) {
+    uint32_t world = R32(kWorld);
+    if (!g_net || !world || !g_remote.in_level || NowMs() - g_last_rx > kTimeoutMs) return false;
+    if (g_remote.level != G<int8_t>(world + kWorldLevel)) return false;
+    std::memcpy(out, g_remote.feet, 12);
+    return true;
 }
 bool HostHeard() { return g_net && g_cfg.role == Role::Join && g_welcomed && NowMs() - g_last_rx <= kTimeoutMs; }
 bool Networked() { return g_net; }
+
+void AskRescue() {
+    if (g_net) g_rescue = true;
+}
+
+void PadRescue(int port, uint16_t buttons) {
+    static uint64_t since[4];
+    static bool done[4];
+    if (port < 0 || port > 3) return;
+    constexpr uint16_t kSticks = 0xC0;  // left and right thumb clicks
+    if ((buttons & kSticks) != kSticks) {
+        since[port] = 0, done[port] = false;
+        return;
+    }
+    uint64_t now = NowMs();
+    if (!since[port]) since[port] = now;
+    else if (!done[port] && now - since[port] >= 1000) {
+        done[port] = true;
+        AskRescue();
+    }
+}
+
+uint32_t Rescues() { return g_rescues; }
+
+namespace {
+
+// a place the partner stood a moment ago, a step or more from it: walked on, not in a wall
+bool TrailPoint(const float partner[3], int8_t level, float out[3]) {
+    constexpr float kNear = 1.2f, kFar = 6.0f;
+    uint64_t first = g_path_count > kPathSize ? g_path_count - kPathSize : 0;
+    for (uint64_t k = g_path_count; k-- > first;) {
+        const PathPoint& p = g_path[k % kPathSize];
+        if (p.level != level) break;
+        float d[3] = {p.feet[0] - partner[0], p.feet[1] - partner[1], p.feet[2] - partner[2]};
+        float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        if (dist > kFar) break;
+        if (dist >= kNear) {
+            std::memcpy(out, p.feet, 12);
+            return true;
+        }
+    }
+    return false;
+}
+
+void Rescue(X86Context& ctx) {
+    uint32_t world = R32(kWorld);
+    if (!world || !Live()) return;
+    int8_t level = G<int8_t>(world + kWorldLevel);
+    float partner[3];
+    bool at = PartnerAt(partner);
+    if (!at && PartnerInLevel() && g_path_count) {  // stopped (its world waits): where it was last
+        const PathPoint& p = g_path[(g_path_count - 1) % kPathSize];
+        if (p.level == level) std::memcpy(partner, p.feet, 12), at = true;
+    }
+    if (!at) {
+        LOGR("coop: get me out of here: the partner is not in this level");
+        return;
+    }
+    float to[3];
+    if (!TrailPoint(partner, level, to)) {
+        // standing still a while: a step behind it along its view, at its height
+        const float* f = g_remote_play.view[kRowForward];
+        float h = std::sqrt(f[0] * f[0] + f[2] * f[2]);
+        std::memcpy(to, partner, 12);
+        if (h > 0.01f) to[0] -= f[0] / h * 1.5f, to[2] -= f[2] / h * 1.5f;
+    }
+    world::RescueAdvance(ctx);  // past the advance the partner went through: this copy's too
+    uint32_t player = world + kWorldPlayer;
+    float* feet = &G<float>(player + kPlayerFeet);
+    float* last = &G<float>(world + kWorldLastPos);
+    for (int i = 0; i < 3; i++) feet[i] = to[i], last[i] = to[i];
+    // facing the partner
+    float d[2] = {partner[0] - to[0], partner[2] - to[2]};
+    if (d[0] * d[0] + d[1] * d[1] > 0.01f)
+        G<float>(world + kWorldController + kControllerYaw) = std::atan2(d[0], d[1]) * 57.2957795f;
+    g_rescues++;
+    LOGR("coop: get me out of here: put at %.1f %.1f %.1f, the partner at %.1f %.1f %.1f", double(to[0]), double(to[1]),
+         double(to[2]), double(partner[0]), double(partner[1]), double(partner[2]));
+}
+
+}  // namespace
 
 void Init() {
     g_session = std::random_device{}() | 1;  // never 0, the value before any partner
@@ -412,8 +511,9 @@ void Init() {
     }
     shots::SetMode(false, g_cfg.echo);
     world::SetMode(false, 0);
-    // --coop-world 4: no partner's body; 3: no host enemies; 2: deaths and triggers; 1: deaths only; 0: no world sync
-    int world_stage = 5;
+    // --coop-world 5: no level flow; 4: no partner's body; 3: no host enemies; 2: deaths and triggers; 1: deaths
+    // only; 0: no world sync
+    int world_stage = 6;
     if (net::Arg("--coop-world", v) && !v.empty()) world_stage = std::atoi(v.c_str());
     if (g_cfg.role == Role::Off) return;
     if (!net::Open(g_cfg.role == Role::Host ? g_cfg.port : 0)) return;  // WSAStartup, before any name lookup
@@ -513,6 +613,7 @@ const char* Status() {
     if (!g_net) std::snprintf(s, sizeof s, g_cfg.echo ? "COOP ECHO" : g_cfg.probe ? "COOP PROBE" : "COOP CONTROL");
     else if (!g_have_peer) std::snprintf(s, sizeof s, "COOP HOST %u WAITING", g_cfg.port);
     else if (now - g_last_rx > kTimeoutMs) std::snprintf(s, sizeof s, "COOP NO PARTNER");
+    else if (world::WaitingForPartner()) std::snprintf(s, sizeof s, "COOP WAITING FOR P2");
     else if (!g_remote.in_level) std::snprintf(s, sizeof s, "COOP P2 IN MENUS");
     else std::snprintf(s, sizeof s, "COOP P2 LEVEL %d", int(g_remote.level));
     return s;
@@ -545,6 +646,8 @@ X86_EXTERN_FUNC(__imp__sub_0020F6A0);
 X86_FUNC(sub_0020F6A0) {
     if (!coop::Active()) return __imp__sub_0020F6A0(ctx, base);
     coop::BeginFrame();
+    coop::world::FlowTick(ctx);  // the world stopped or not
+    if (coop::g_rescue.exchange(false)) coop::Rescue(ctx);
     coop::Control(ctx);  // test commands; the game object stays in eax, hle calls put registers back
     __imp__sub_0020F6A0(ctx, base);
     coop::EndFrame();

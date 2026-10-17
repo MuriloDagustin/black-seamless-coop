@@ -43,7 +43,7 @@ index 4cf9854..45fb2f2 100644
      g_focus_paused = true;
      audio::SetPaused(true);
 diff --git a/src/common/game_info.cpp b/src/common/game_info.cpp
-index d839025..78659d0 100644
+index d839025..52324da 100644
 --- a/src/common/game_info.cpp
 +++ b/src/common/game_info.cpp
 @@ -17,6 +17,8 @@
@@ -55,7 +55,15 @@ index d839025..78659d0 100644
  
  namespace game {
  
-@@ -84,8 +86,23 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+@@ -56,6 +58,7 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+                 return true;
+             }
+             if (msg == WM_KEYDOWN && wp == VK_ESCAPE && MenuOpen() && !Capturing()) ToggleMenu();
++            if (msg == WM_KEYDOWN && wp == VK_F8 && !(lp & kKeyWasDown) && !MenuOpen()) coop::AskRescue();  // co-op
+             break;
+         case WM_SYSCOMMAND:
+             // a bound Alt must not open the window menu
+@@ -84,9 +87,25 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
      return false;
  }
  
@@ -77,9 +85,11 @@ index d839025..78659d0 100644
 +        return;
 +    }
      input::SeenPad(pad);
++    coop::PadRescue(port, pad.buttons);  // co-op: L3 + R3 held, before the keyboard's C and RMB join them
      if (port == 0) pad.connected = true;
      if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
-@@ -94,6 +111,11 @@ void Pad(int port, input::Pad& pad) {
+     else if (port == 0) input::Keyboard(pad);
+@@ -94,6 +113,11 @@ void Pad(int port, input::Pad& pad) {
  
  // no vibration while the keyboard and mouse are in use
  void Rumble(int port, uint16_t& left, uint16_t& right) {
@@ -91,7 +101,7 @@ index d839025..78659d0 100644
      if (port != 0 || !input::KeyboardActive()) return;
      left = 0;
      right = 0;
-@@ -118,6 +140,7 @@ void Init() {
+@@ -118,6 +142,7 @@ void Init() {
      BootLanguage();  // latched before the panel can change the setting
      input::LoadBindings();
      audio::SetOutputMode(Opt().audio_output);
@@ -99,7 +109,7 @@ index d839025..78659d0 100644
  }
  
  void Save(void* table) {
-@@ -170,7 +193,9 @@ const app::GameInfo app::kGame = {
+@@ -170,7 +195,9 @@ const app::GameInfo app::kGame = {
                  {"draw_distance", nullptr, &game::Opt().draw_distance},
                  {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
                  {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},

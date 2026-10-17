@@ -46,6 +46,8 @@ namespace coop::control {
 
 namespace {
 
+int g_next_level = -1;  // a test's level for the next load
+
 constexpr uint32_t kFrameCount = 0x2F4368;
 constexpr uint32_t kWorldLevel = 0x5AEC;
 constexpr uint32_t kWorldUnit = 0x5AF0;
@@ -198,10 +200,11 @@ std::string State() {
     const npcs::Counters& nc = npcs::Count();
     std::snprintf(buf, sizeof buf,
                   " shots=%u/%u/%u/%u flash=%u gunshot=%u heard=%u slot=%08X sound=%08X sstate=%u world=%u/%u/%u/%u/%u/%u/%u"
-                  " props=%u proj=%u npcs=%u/%u/%u/%u/%u body=%08X/%u seen=%u targeted=%u coop=\"%s\"",
+                  " props=%u proj=%u npcs=%u/%u/%u/%u/%u body=%08X/%u seen=%u targeted=%u rescues=%u coop=\"%s\"",
                   sc.sent, sc.taken, sc.fired, sc.dropped, sc.flashes, sc.gunshots, sc.heard, slot, sound, sstate, wc.sent, wc.taken,
                   wc.applied, wc.waiting, wc.lost, wc.stale, wc.triggers, wc.props, wc.projectiles, nc.snapshots, nc.made,
-                  nc.let_go, nc.driven, nc.refused, npcs::Body(), nc.bodies, nc.seen, nc.targeted, coop::Status());
+                  nc.let_go, nc.driven, nc.refused, npcs::Body(), nc.bodies, nc.seen, nc.targeted, coop::Rescues(),
+                  coop::Status());
     s += buf;
     return s;
 }
@@ -262,7 +265,7 @@ void TriggerCentre(uint32_t t, float out[3]) {
 }
 
 // the logic manager's type 11 triggers: list, id, armed, mode, action, the box's centre and half sizes
-std::string Triggers(bool all) {
+std::string Triggers(bool all, bool units = false) {
     uint32_t mgr = R32(kLogic);
     if (!mgr || !R32(kWorld)) return "none";
     const float* eye = &G<float>(Player() + kPlayerEye);
@@ -276,6 +279,7 @@ std::string Triggers(bool all) {
             if (!t || R32(t) != kTriggerVtable) continue;
             bool armed = G<uint8_t>(t + 0x11C);
             if (!all && !armed) continue;
+            if (units && R32(t + 0x124) == 0) continue;  // only the unit triggers (actions 1, 2)
             float p[3];
             TriggerCentre(t, p);
             const float* half = &G<float>(t + 0x130);
@@ -420,7 +424,7 @@ std::string Run(const std::string& line) {
     if (c == "ping") return "pong frame=" + std::to_string(R32(kFrameCount));
     if (c == "state") return State();
     if (c == "npcs") return Npcs();
-    if (c == "triggers") return Triggers(a.size() > 1 && a[1] == "all");
+    if (c == "triggers") return Triggers(a.size() > 1 && (a[1] == "all" || a[1] == "units"), a.size() > 1 && a[1] == "units");
     if (c == "props") return Props(std::clamp(a.size() > 1 ? std::atoi(a[1].c_str()) : 12, 1, 60));
     if (c == "stand") {
         // stand <list.index | id hex> [frames]
@@ -434,6 +438,23 @@ std::string Run(const std::string& line) {
         return buf;
     }
     if (c == "page") return PageName();
+    if (c == "rescue") {  // the players' "get me out of here", as F8 asks it
+        coop::AskRescue();
+        return "asked";
+    }
+    if (c == "flow") {  // the in-level state's request as the game makes it: fail (vf5, a death) or complete (vf6)
+        uint32_t game = R32(0x2D45F0);
+        if (!game || a.size() < 2 || (a[1] != "fail" && a[1] != "complete")) return "error flow fail|complete";
+        static constexpr hle::Map kOne = hle::Make({hle::ecx, hle::stack});
+        hle::Call(*g_ctx, a[1] == "fail" ? 0x1F45C0 : 0x1F45B0, kOne, {game + 0x20F78, 0});
+        LOGR("ctl: flow %s", a[1].c_str());
+        return "asked " + a[1];
+    }
+    if (c == "level") {  // the next level load is of that level, from its first unit (as the mission select, 0x11B9DC)
+        if (a.size() < 2) return "error level <n>";
+        g_next_level = std::clamp(std::atoi(a[1].c_str()), 0, 15);
+        return "next load: level " + std::to_string(g_next_level);
+    }
     if (c == "log") {
         LOGR("ctl: %s", line.c_str());
         return "ok";
@@ -634,3 +655,19 @@ bool Override(int port, input::Pad& pad) {
 }
 
 }  // namespace coop::control
+
+// The level loader (stdcall the world; ret 4) reads the level, its first unit and stage from the game (0x1EDD64):
+// a test's "level" puts its own there first
+X86_EXTERN_FUNC(__imp__sub_001EDC90);
+X86_FUNC(sub_001EDC90) {
+    using namespace coop::control;
+    uint32_t game = R32(0x2D45F0);
+    if (g_next_level >= 0 && game) {
+        G<uint8_t>(game + 0x2020C) = uint8_t(g_next_level);
+        G<uint8_t>(game + 0x2020D) = 1;
+        G<uint8_t>(game + 0x2020E) = 1;
+        LOGR("ctl: loading level %d", g_next_level);
+        g_next_level = -1;
+    }
+    __imp__sub_001EDC90(ctx, base);
+}

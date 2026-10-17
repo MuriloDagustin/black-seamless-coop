@@ -18,13 +18,18 @@ versions this mod was made with, and puts the mod on top. You need your own copy
 |---|---|
 | Connection | UDP, host and join, reconnects when either side restarts |
 | Partner marker | the partner's position drawn over the frame (`P2 12`, arrows at the edges) |
-| Partner bullets | the partner's shots are fired again on your copy through the game's own bullet code: impacts, decals, glass, destruction and damage to enemies, with a tracer. They never hit you or touch your ammo or HUD |
+| Partner's body | each copy shows the partner as a soldier walking where the partner walks and looking where it looks |
+| Partner bullets | the partner's shots are fired again on your copy through the game's own bullet code: impacts, decals, glass, destruction and damage to enemies, with a tracer, the partner's muzzle flash and a 3D gunshot. They never hit you or touch your ammo or HUD |
+| Enemies | the host runs them: on the joining copy each enemy is a puppet of the host's (position, animation, aim, fire, reloads, health and death). They see, hear and shoot the joining player's body, so the joining player is hit by them |
 | Enemy deaths | an enemy killed on one copy dies on the other, ragdoll and scripts included |
+| Props, grenades, rockets | crates, barrels and breakable scenery break on both copies; the partner's grenades and rockets fly and explode on yours |
 | Triggers | one-shot area triggers (enemy waves, scripted scenes) fire for either player's position |
+| Level flow | the game moves on to the next area only when both players have gone through; the one ahead waits at the next door (a LOADING screen) until the other comes. Mission failed and level complete count for both |
+| Get me out of here | **F8**, or **L3 + R3** held for a second on a controller: you are put next to your partner, on the way it just walked |
 | Test channel | `--coop-control`: a local text channel that drives a copy without its window's focus (pad, aim, teleport, state), for automated two-copy tests |
 
-Not yet: the partner's body, the gunshot sound and muzzle flash, grenades and rockets, enemies
-moved by the host, props destroyed in sync, level flow (area changes, level end) for both players.
+Not yet: retrying a failed mission together (each player picks Continue on its own copy),
+cinematics in sync, vehicles.
 
 ## Setup
 
@@ -68,7 +73,7 @@ BLACK.exe --instance 2 --coop join --join 127.0.0.1 --mute
 | `--coop host` / `--coop join` | role, for this copy only |
 | `--join <address>` | the host to join (or `join_ip` in `black.toml`) |
 | `--coop-port <n>` | the host's UDP port (or `coop_port`), 45410 by default |
-| `--coop-world <n>` | world sync: 2 deaths and triggers (default), 1 deaths only, 0 off |
+| `--coop-world <n>` | world sync: 6 everything (default), 5 no level flow, 4 no partner's body, 3 no host-run enemies, 2 deaths and triggers, 1 deaths only, 0 off |
 | `--instance <n>` | a second copy on one PC: its own saves (`hddN`) and log |
 | `--mute` | no sound |
 | `--coop-probe` | on-screen readout: position, shot and world event counters |
@@ -80,8 +85,9 @@ BLACK.exe --instance 2 --coop join --join 127.0.0.1 --mute
 One command per UDP datagram, one reply each: `ping`, `state`, `npcs`, `page`, `triggers [all]`,
 `pad <a,b,x,y,lt,rt,up,down,left,right,start,back,...> [ms]`, `hold <names>`, `stick <lx> <ly> <rx> <ry> [ms]`,
 `release`, `yaw`/`pitch`/`turn <deg>`, `aim <x> <y> <z>` / `aim nearest` / `aim off`,
-`teleport <x> <y> <z>` / `teleport partner`, `stand <trigger> [frames]`, `peek`/`peekf <addr> [n]`,
-`pokef <addr> <floats>`, `log <text>`. Addresses take `@player+hex` and `@world+hex`.
+`teleport <x> <y> <z>` / `teleport partner`, `rescue` (as F8), `stand <trigger> [frames]`,
+`triggers units`, `props [n]`, `rocket`, `level <n>` (the next load), `flow fail|complete`,
+`peek`/`peekf <addr> [n]`, `pokef <addr> <floats>`, `log <text>`. Addresses take `@player+hex` and `@world+hex`.
 
 `black.toml` also takes `coop = 1` (host) or `2` (join) to make a role the default.
 
@@ -96,15 +102,24 @@ The port lets host code replace any recompiled function at link time. The mod wr
 - the character spawn `0x1DF440` and the death paths `0x205C60`, `0x1DA240`, `0x1DA1A0`: an enemy is
   named by its spawner's 64-bit record name, which is the same on both copies; the partner's deaths are
   played with the game's own death function;
-- the logic tick `0x1E7FF0`: one-shot triggers are tested again at the partner's position.
+- the logic tick `0x1E7FF0`: one-shot triggers are tested again at the partner's position;
+- the AI think `0x1E5F70` and the characters' update `0x1CCBB0`: on the joining copy the host's enemies are
+  driven from the host's snapshots (30 a second) instead of their own AI;
+- the ally spawn `0x1AF880`: the partner's body is an ally made the way the game makes a squad mate, and the
+  enemies' perception `0x1AD440` sees it in an empty squad slot;
+- the unit advance `0x1B73B0`, the next unit's activation `0x1C7620` and the in-level state's requests
+  `0x1F45C0`/`0x1F45B0`/`0x1F4590`: the level flow for both players.
 
 ## Português
 
 Co-op em rede para dois jogadores no **Black**, feito como mod da port para PC
 [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp). Este repositório tem só o código do co-op;
 o `setup.bat` baixa a port e o SDK nas versões testadas e aplica o mod. Você precisa da sua própria cópia
-do jogo. Funciona hoje: conexão, marcador do parceiro, balas do parceiro com impacto e dano, mortes de
-inimigos sincronizadas e gatilhos de área disparados por qualquer um dos dois jogadores.
+do jogo. Funciona hoje: conexão, corpo e marcador do parceiro, balas do parceiro com impacto, dano, clarão
+e estampido, inimigos controlados pelo host (que enxergam e atiram no parceiro), mortes, objetos
+destrutíveis, granadas e foguetes sincronizados, gatilhos de área disparados por qualquer um dos dois,
+troca de área esperando os dois jogadores, missão falhada e fim de fase valendo para ambos, e
+"me tira daqui": **F8** ou **L3 + R3** segurados por um segundo te levam para perto do parceiro.
 
 ## License
 

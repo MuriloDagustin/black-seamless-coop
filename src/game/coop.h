@@ -18,7 +18,13 @@ void EndFrame();       // this copy's player, to the partner
 void MarkSimulated();  // the player update runs this frame (PhysicsTime 0x1F11CD)
 void LatchCamera();    // the scene camera's view and projection are the device's (AmbientOcclusion 0x1EE9A5)
 bool PartnerFeet(float out[3]);  // the partner's body in this level, in play and heard from of late
-bool PartnerInLevel();           // heard from of late, its last level this one: in play or paused in it
+bool PartnerInLevel();           // heard from of late, its last load this level: in play or paused in it a while
+bool PartnerAt(float out[3]);    // the partner in play in this level, this copy's world stopped or not
+// "get me out of here": this copy's player put next to the partner, on the way the partner came. Asked from any
+// thread (F8, a controller's two stick clicks held a second, the test channel); done at the next frame
+void AskRescue();
+void PadRescue(int port, uint16_t buttons);  // the pad thread: a controller's L3 + R3 held
+uint32_t Rescues();
 bool HostHeard();                // a joining copy: its host welcomed it and was heard from of late
 bool InPlay();                   // the world steps and its player with it
 const float* PartnerForward();   // the partner's view, its last state's forward row
