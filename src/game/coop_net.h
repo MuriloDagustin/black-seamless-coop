@@ -1,0 +1,23 @@
+#pragma once
+// The co-op's Win32 side: one non-blocking UDP socket, the command line and the window's focus
+#include <cstdint>
+#include <string>
+
+namespace coop::net {
+
+struct Peer {
+    uint32_t addr = 0;  // IPv4, network order
+    uint16_t port = 0;  // host order
+};
+inline bool operator==(const Peer& a, const Peer& b) { return a.addr == b.addr && a.port == b.port; }
+
+bool Open(uint16_t port);                  // 0: any free port
+uint32_t Resolve(const std::string& host);  // an IPv4 or a name; 0 when not found
+bool Send(const Peer& to, const void* p, int n);
+int Receive(Peer& from, void* p, int n);  // -1 nothing waiting, 0 a datagram lost, else its bytes
+std::string Text(const Peer& p);          // a.b.c.d:port
+// --name value or --name=value on this process's command line; true when the name is there, value may stay empty
+bool Arg(const char* name, std::string& value);
+bool Foreground();  // the game window is the one in front
+
+}  // namespace coop::net

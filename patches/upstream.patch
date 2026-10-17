@@ -1,0 +1,250 @@
+diff --git a/src/audio/xaudio2.cpp b/src/audio/xaudio2.cpp
+index ec16f14..a5b910d 100644
+--- a/src/audio/xaudio2.cpp
++++ b/src/audio/xaudio2.cpp
+@@ -10,6 +10,7 @@
+ #include <xaudio2.h>
+ 
+ #include <atomic>
++#include <cwchar>
+ #include <future>
+ #include <optional>
+ #include <thread>
+@@ -150,6 +151,8 @@ std::optional<Output> Open() {
+     Output out;
+     if (FAILED(XAudio2Create(&out.xa, 0, XAUDIO2_DEFAULT_PROCESSOR))) return std::nullopt;
+     if (FAILED(out.xa->CreateMasteringVoice(&out.master))) return std::nullopt;
++    // --mute: silent, the mixer and the game's sound clock run on as ever (test copies)
++    if (std::wcsstr(GetCommandLineW(), L"--mute")) out.master->SetVolume(0.0f);
+     WAVEFORMATEXTENSIBLE wf = MixFormat();
+     if (FAILED(out.xa->CreateSourceVoice(&out.voice, &wf.Format))) return std::nullopt;
+     ApplyMatrix(out);
+diff --git a/src/common/focus_pause.cpp b/src/common/focus_pause.cpp
+index 4cf9854..0ece468 100644
+--- a/src/common/focus_pause.cpp
++++ b/src/common/focus_pause.cpp
+@@ -11,6 +11,7 @@
+ #include "audio/output.h"
+ #include "common/options.h"
+ #include "core/log.h"
++#include "game/coop.h"
+ 
+ namespace game {
+ 
+@@ -28,7 +29,8 @@ bool Unfocused() {
+ }  // namespace
+ 
+ void WaitWhileUnfocused() {
+-    if (!Opt().pause_on_focus_loss || !Unfocused()) return;
++    // the partner waits on this copy's packets: in the background it plays on
++    if (!Opt().pause_on_focus_loss || coop::Networked() || !Unfocused()) return;
+     LOGI("focus lost: paused");
+     g_focus_paused = true;
+     audio::SetPaused(true);
+diff --git a/src/common/game_info.cpp b/src/common/game_info.cpp
+index d839025..58459d2 100644
+--- a/src/common/game_info.cpp
++++ b/src/common/game_info.cpp
+@@ -17,6 +17,7 @@
+ #include "common/monitor.h"
+ #include "common/mouse_keyboard.h"
+ #include "common/options.h"
++#include "game/coop.h"
+ 
+ namespace game {
+ 
+@@ -84,8 +85,22 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+     return false;
+ }
+ 
++// two co-op copies on one PC share the controllers: the one in the background neither reads nor drives them
++bool CoopBackground() {
++    return app::Instance() && coop::Networked() && GetForegroundWindow() != static_cast<HWND>(app::Window());
++}
++
+ // port 0 has the keyboard; the game sees no input while the panel is open
+ void Pad(int port, input::Pad& pad) {
++    if (CoopBackground()) {
++        // the keyboard's poll still sees the window inactive: the click that brings it in front is not taken
++        if (port == 0) {
++            input::Pad unused;
++            input::Keyboard(unused);
++        }
++        pad = input::Pad{.connected = port == 0 || pad.connected};
++        return;
++    }
+     input::SeenPad(pad);
+     if (port == 0) pad.connected = true;
+     if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
+@@ -94,6 +109,11 @@ void Pad(int port, input::Pad& pad) {
+ 
+ // no vibration while the keyboard and mouse are in use
+ void Rumble(int port, uint16_t& left, uint16_t& right) {
++    if (CoopBackground()) {
++        left = 0;
++        right = 0;
++        return;
++    }
+     if (port != 0 || !input::KeyboardActive()) return;
+     left = 0;
+     right = 0;
+@@ -118,6 +138,7 @@ void Init() {
+     BootLanguage();  // latched before the panel can change the setting
+     input::LoadBindings();
+     audio::SetOutputMode(Opt().audio_output);
++    coop::Init();
+ }
+ 
+ void Save(void* table) {
+@@ -170,7 +191,9 @@ const app::GameInfo app::kGame = {
+                 {"draw_distance", nullptr, &game::Opt().draw_distance},
+                 {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
+                 {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
+-                {"audio_output", nullptr, &game::Opt().audio_output}},
++                {"audio_output", nullptr, &game::Opt().audio_output},
++                {"coop", nullptr, &game::Opt().coop},
++                {"coop_port", nullptr, &game::Opt().coop_port}},
+     .load = game::Load,
+     .save = game::Save,
+     .init = game::Init,
+diff --git a/src/common/options.h b/src/common/options.h
+index 8c56e8b..fd64c46 100644
+--- a/src/common/options.h
++++ b/src/common/options.h
+@@ -30,6 +30,8 @@ struct Options {
+     std::string language = "int";  // one of kLanguages
+     bool smaa = false;  // over the finished frame, HUD included; combines with msaa
+     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
++    uint32_t coop = 0;  // co-op: 0 off, 1 host, 2 join the host at join_ip; --coop host|join for one copy
++    uint32_t coop_port = 45410;  // UDP, the host's
+     std::map<std::string, std::string> keys;  // action id to key names, absent is the default
+ };
+ Options& Opt();
+diff --git a/src/game/ambient_occlusion.cpp b/src/game/ambient_occlusion.cpp
+index 575cf99..d1a085e 100644
+--- a/src/game/ambient_occlusion.cpp
++++ b/src/game/ambient_occlusion.cpp
+@@ -2,6 +2,7 @@
+ // depth buffer, and leaves, glass, particles, shadows, decals, the bloom and the HUD land on top.
+ #include "common/options.h"
+ #include "d3d/occlusion.h"
++#include "game/coop.h"
+ #include "xdk/hle.h"
+ 
+ using namespace kernel;
+@@ -14,6 +15,7 @@ constexpr uint32_t kProjection = 0x297720;  // camera to screen, written only by
+ 
+ // before the frame's call that sorts and draws list 2, the alpha blended meshes
+ void AmbientOcclusion(X86Context&, uint8_t*) {
++    coop::LatchCamera();  // the scene camera's view and projection, for the partner's marker
+     uint32_t mode = game::Opt().ambient_occlusion;
+     if (mode) d3d::Occlusion(&G<float>(kProjection), mode == 2);
+ }
+diff --git a/src/game/fps_counter.cpp b/src/game/fps_counter.cpp
+index 0b0a5db..28fbf38 100644
+--- a/src/game/fps_counter.cpp
++++ b/src/game/fps_counter.cpp
+@@ -8,6 +8,7 @@
+ #include "app/app.h"
+ #include "common/aspect.h"
+ #include "common/options.h"
++#include "game/coop.h"
+ #include "game/flash.h"
+ #include "game/layout.h"
+ #include "xdk/hle.h"
+@@ -68,16 +69,17 @@ float TextWidth(uint32_t font, const char* text) {
+     return advance * G<float>(font + kFontScale) * kSize;
+ }
+ 
+-// x and y in lines of a 480 frame from the output's top left
+-void DrawText(X86Context& ctx, uint32_t font, const View& view, const char* text, float x, float y, bool shadow) {
++// x and y in lines of a 480 frame from the output's top left; rgb null is the HUD's grey
++void DrawText(X86Context& ctx, uint32_t font, const View& view, const char* text, float x, float y, bool shadow,
++              const float* rgb = nullptr) {
+     static const uint32_t block = mem::AllocSystem(0x60);
+     uint32_t colour = block;
+     uint32_t chars = block + 0x10;
+     int n = std::min(int(std::strlen(text)), 31);
+     for (int i = 0; i <= n; i++) G<uint16_t>(chars + i * 2) = i < n ? uint8_t(text[i]) : 0;
+     for (int s = shadow; s >= 0; s--) {
+-        float rgb = s ? 0.0f : kGrey;  // the shadow black
+-        for (int i = 0; i < 4; i++) G<float>(colour + i * 4) = i == 3 ? 1.0f : rgb;
++        // the shadow black
++        for (int i = 0; i < 4; i++) G<float>(colour + i * 4) = i == 3 ? 1.0f : s ? 0.0f : rgb ? rgb[i] : kGrey;
+         float px = (x + s) * view.unit * view.narrow;
+         float py = (y + s) * view.unit;
+         CallGuest(ctx, kText, {font, chars, std::bit_cast<uint32_t>(px), std::bit_cast<uint32_t>(py),
+@@ -119,6 +121,26 @@ std::optional<float> LegendSlide(const TitlePage& page) {
+     return G<float>(prompt + kClipX) - page.legend_rest_x;
+ }
+ 
++// a marker's text centred on its point; the font is drawn narrowed here, which TextWidth already has
++void DrawMarker(X86Context& ctx, uint32_t font, const View& view, const coop::Marker& m, const float* rgb) {
++    float width = TextWidth(font, m.text) / view.narrow;
++    DrawText(ctx, font, view, m.text, m.x - width / 2, m.y - kSize / 2, true, rgb);
++}
++
++// the co-op's status under the frame rate, the partner where it stands, the probe's readout
++void DrawCoop(X86Context& ctx, uint32_t font, const View& view, float top) {
++    static const float kPartner[3] = {0.35f, 0.9f, 1.0f};
++    static const float kProbe[3] = {1.0f, 0.85f, 0.2f};
++    DrawText(ctx, font, view, coop::Status(), kMargin, top, true);
++    char lines[8][32];
++    int n = coop::ProbeLines(lines, 8);
++    for (int i = 0; i < n; i++) DrawText(ctx, font, view, lines[i], kMargin, top + (i + 1) * (kSize + 2), true, kProbe);
++    if (game::g_hide_hud) return;
++    coop::Marker m;
++    if (coop::ProbeMarker(m)) DrawMarker(ctx, font, view, m, kProbe);
++    if (coop::RemoteMarker(m)) DrawMarker(ctx, font, view, m, kPartner);
++}
++
+ }  // namespace
+ 
+ // D3DVIEWPORT8
+@@ -135,7 +157,8 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
+     const TitlePage* title = CurrentTitlePage();
+     std::optional<float> slide = title ? LegendSlide(*title) : std::nullopt;
+     bool watermark = slide.has_value();
+-    if (!(fps || watermark) || !font || !(h > 0)) return;
++    bool partner = coop::Active();
++    if (!(fps || watermark || partner) || !font || !(h > 0)) return;
+     View view{h / 480, w / h / game::Aspect()};
+     float& width = G<float>(font + kFontScale);
+     float game_width = width;
+@@ -149,6 +172,7 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
+         DrawText(ctx, font, view, text, kMargin, kMargin, true);
+     }
+     if (watermark) DrawText(ctx, font, view, kWatermark, watermark_x, kWatermarkTop, false);
++    if (partner) DrawCoop(ctx, font, view, kMargin + (fps ? kSize + 2 : 0));
+     width = game_width;
+     if (R32(kQuads)) CallGuest(ctx, kFlush, {});
+     CallGuest(ctx, kEnd, {});
+diff --git a/src/game/hooks.cpp b/src/game/hooks.cpp
+index c749e20..ad98326 100644
+--- a/src/game/hooks.cpp
++++ b/src/game/hooks.cpp
+@@ -8,6 +8,8 @@
+ #include "common/mouse_keyboard.h"
+ #include "common/options.h"
+ #include "core/input.h"
++#include "game/coop.h"
++#include "game/coop_shots.h"
+ #include "game/layout.h"
+ #include "xdk/d3d8.h"
+ #include "xdk/hle.h"
+@@ -248,6 +250,7 @@ void TracerStart(X86Context& ctx, uint8_t*) {
+     uint32_t shot = R32(ctx.esi + kBulletShot);
+     uint32_t weapon = shot ? R32(shot + kShotWeapon) : 0;
+     if (g_gun == 1 || !weapon || R32(weapon + kWeaponOwner) != Player()) return;
++    if (coop::shots::GhostWeapon(weapon)) return;  // the partner's bullet: its tracer is not on our gun
+     static uint32_t copy = mem::AllocSystem(16, 16);
+     std::memcpy(HostPtr(copy), HostPtr(ctx.eax), 16);
+     ctx.eax = copy;
+@@ -407,6 +410,7 @@ static void ScaleBodies(uint32_t world, float by) {
+ // both follow the real frame time, before the characters write theirs
+ static bool g_rest_tick;
+ void PhysicsTime(X86Context&, uint8_t*) {
++    coop::MarkSimulated();  // from here the code runs on to the player update at 0x1F1201
+     uint32_t physics = R32(kPhysics);
+     uint32_t solver = physics ? R32(physics) : 0;
+     uint32_t world = solver ? R32(solver + kSolverWorld) : 0;

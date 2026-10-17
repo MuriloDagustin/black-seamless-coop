@@ -1,0 +1,5 @@
+# the port setup.bat puts here, and anything of the game
+black-recomp/
+assets/
+*.iso
+*.xbe
