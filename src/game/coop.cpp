@@ -47,6 +47,7 @@ constexpr uint32_t kPlayerView = 0xD0;  // right, up, forward, eye
 constexpr uint32_t kPlayerFeet = 0xA0;  // the body's position, the last row of its matrix
 constexpr uint32_t kRowEye = 3;
 constexpr uint32_t kRowForward = 2;
+constexpr uint32_t kPlayerCrouch = 0x3A1;
 constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
 constexpr uint32_t kTransformView = 0;  // XDK transform types
 constexpr uint32_t kTransformProjection = 1;
@@ -60,7 +61,7 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 10;
+constexpr uint16_t kProtocol = 11;
 enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap };
 
 #pragma pack(push, 1)
@@ -81,6 +82,7 @@ struct State {
     int8_t level;
     uint8_t load;        // the sender's level loads (world::Load)
     int8_t load_level;   // and the level of its last
+    uint8_t crouch;      // its player crouches (player+0x3A1, from its controller +0x40 at 0x1F09C1)
     float view[4][3];  // right, up, forward, eye
     float feet[3];     // the body, player+0xA0: where the triggers test the player
     float yaw, pitch;
@@ -188,6 +190,7 @@ void Sample(State& s, uint64_t now) {
     std::memcpy(s.feet, HostPtr(player + kPlayerFeet), 12);
     s.yaw = G<float>(world + kWorldController + kControllerYaw);
     s.pitch = G<float>(world + kWorldController + kControllerPitch);
+    s.crouch = G<uint8_t>(player + kPlayerCrouch);
     if (!Finite(s)) s.in_level = 0;
 }
 
@@ -383,6 +386,7 @@ int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap) {
 uint64_t PartnerPathEnd() { return g_path_count; }
 
 const float* PartnerForward() { return g_remote_play.view[kRowForward]; }
+bool PartnerCrouch() { return g_remote.in_level && g_remote.crouch; }
 
 bool PartnerFeet(float out[3]) {
     uint32_t world = R32(kWorld);

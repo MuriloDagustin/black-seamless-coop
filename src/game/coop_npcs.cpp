@@ -241,7 +241,7 @@ void DriveBody(uint32_t ctl) {
     float move[4] = {g_body_dir[0], g_body_dir[1], g_body_dir[2], 0};
     std::memcpy(HostPtr(ctl + kControlMoveDir), move, 16);
     G<float>(ctl + kControlRate) = g_body_rate;
-    G<uint8_t>(ctl + kControlCrouch) = 0;
+    G<uint8_t>(ctl + kControlCrouch) = coop::PartnerCrouch() ? 1 : 0;
     for (uint32_t b = 0x41; b <= 0x45; b++) G<uint8_t>(ctl + b) = 0;
     G<uint8_t>(ctl + 0x4B) = 0, G<uint8_t>(ctl + 0x4C) = 0;
     G<uint8_t>(g_body + kCharKinematic) = 1;
@@ -687,4 +687,26 @@ X86_EXTERN_FUNC(__imp__sub_001D6000);
 X86_FUNC(sub_001D6000) {
     if (IsBody(ctx.edx) || (HostOwned(ctx.edx) && !coop::world::Applying())) return Return(ctx, ctx.eax, 1);
     __imp__sub_001D6000(ctx, base);
+}
+
+// The AI's nearest-character scans (0x1C2F30: ecx a sphere; 0x1C30D0: &pos, edx the out list; ret 4) leave out the
+// squad by controller type: the body, of an enemy soldier's type where the level has no squad mate's, is left out
+// too (its controller's type +0x90 not an AI's while they run). A grenade's warning then goes to a real enemy
+template <class F>
+void WithoutBody(F f) {
+    uint32_t ctl = BodyAlive() ? R32(g_body + kCharControl) : 0;
+    uint32_t type = ctl ? R32(ctl + 0x90) : 0;
+    if (ctl) W32(ctl + 0x90, 0);
+    f();
+    if (ctl) W32(ctl + 0x90, type);
+}
+
+X86_EXTERN_FUNC(__imp__sub_001C2F30);
+X86_FUNC(sub_001C2F30) {
+    WithoutBody([&] { __imp__sub_001C2F30(ctx, base); });
+}
+
+X86_EXTERN_FUNC(__imp__sub_001C30D0);
+X86_FUNC(sub_001C30D0) {
+    WithoutBody([&] { __imp__sub_001C30D0(ctx, base); });
 }

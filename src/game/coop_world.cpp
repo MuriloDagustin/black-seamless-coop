@@ -444,9 +444,8 @@ Result ApplyMelee(X86Context& ctx, const Event& e) {
     std::memcpy(HostPtr(g_dir), dir, 16);
     uint32_t by = coop::npcs::Body();
     static constexpr hle::Map kMeleeMap = hle::Make({hle::ecx, hle::stack, hle::stack, hle::stack, hle::stack});
-    g_applying = true;
+    // not as the partner's event: the death it makes here goes to the partner as the host's own (its ragdoll there)
     hle::Call(ctx, kMeleeHit, kMeleeMap, {ch, 0, g_dir, 0, by ? by : Player()});
-    g_applying = false;
     g_count.applied++;
     PROBE("melee! %08X%08X by the partner", e.name_hi, e.name_lo);
     return Result::Done;

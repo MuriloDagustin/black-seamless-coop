@@ -34,7 +34,6 @@ constexpr uint32_t kBulletSize = 0x90;
 constexpr int kBulletCount = 16;
 constexpr uint32_t kBulletLive = 0x88;      // byte
 constexpr uint32_t kBulletDistance = 0x74;  // float: to the hit, or the range
-constexpr float kBodySkip = 0.6f;  // a partner's bullet starts past the partner's body
 constexpr uint32_t kHear = 0x1A22B0;  // eax the noise class, ecx [kAi], edi &pos; the shooter; ret 4
 constexpr uint32_t kNoiseClasses = 0x2D680C;  // [it] + weapon type * 4: the type's noise class
 constexpr uint32_t kNoiseNone = 0x0B;
@@ -374,16 +373,11 @@ void Fire(X86Context& ctx, const Event& e) {
             return;
         }
         const Pellet& p = e.pellets[i];
-        // out of the partner's body here first: it stands at the partner's eye
-        float skip = coop::npcs::Body() && e.range > kBodySkip * 2 ? kBodySkip : 0.0f;
-        float from[4] = {p.origin[0] + p.dir[0] * skip, p.origin[1] + p.dir[1] * skip, p.origin[2] + p.dir[2] * skip,
-                         p.origin[3]};
-        float range = e.range - skip;
-        std::memcpy(HostPtr(origin), from, 16);
+        std::memcpy(HostPtr(origin), p.origin, 16);
         std::memcpy(HostPtr(dir), p.dir, 16);
         g_replaying = true;
         uint32_t spawned = hle::Call(ctx, kSpawn, kSpawnMap,
-                                     {origin, g_pool, ghost->gun, dir, std::bit_cast<uint32_t>(range),
+                                     {origin, g_pool, ghost->gun, dir, std::bit_cast<uint32_t>(e.range),
                                       std::bit_cast<uint32_t>(e.speed), e.flags}) & 0xFF;
         g_replaying = false;
         if (!spawned) {
@@ -393,10 +387,8 @@ void Fire(X86Context& ctx, const Event& e) {
         if (!g_count.fired++) LOGR("coop: first partner bullet fired, type %d", type);
         float reach = G<float>(slot + kBulletDistance);
         if (!std::isfinite(reach) || reach <= 0) continue;  // the muzzle on a wall: nothing to draw
-        reach += skip;
         float to[4] = {p.origin[0] + p.dir[0] * reach, p.origin[1] + p.dir[1] * reach,
                        p.origin[2] + p.dir[2] * reach, p.origin[3]};
-        std::memcpy(HostPtr(origin), p.origin, 16);
         std::memcpy(HostPtr(end), to, 16);
         hle::Call(ctx, kTracer, kTracerMap, {R32(kTracers) + kTracerList, 1, origin, end});
     }
@@ -612,4 +604,16 @@ X86_FUNC(sub_001CEED0) {
     g_bound_lo = g_bound_hi = 0;
     DropQueue();
     coop::world::LevelReset();
+}
+
+// A ray (eax &from, ecx &to; the world, its flags, an entity it passes through, ..., &result; ret 0x14): the partner's
+// bullets stepped here pass through the partner's body, as a player's own pass through the player (the step's
+// character ray 0x1E2779 passes none; 0x1CDDFD and 0x1CDF4A skip the one at +0x24)
+X86_EXTERN_FUNC(__imp__sub_001DAFF0);
+X86_FUNC(sub_001DAFF0) {
+    if (coop::shots::SteppingPartner() && R32(ctx.esp + 0xC) == 0) {
+        uint32_t body = coop::npcs::Body();
+        if (body) W32(ctx.esp + 0xC, body);
+    }
+    __imp__sub_001DAFF0(ctx, base);
 }

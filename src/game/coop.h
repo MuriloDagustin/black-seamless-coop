@@ -28,6 +28,7 @@ uint32_t Rescues();
 bool HostHeard();                // a joining copy: its host welcomed it and was heard from of late
 bool InPlay();                   // the world steps and its player with it
 const float* PartnerForward();   // the partner's view, its last state's forward row
+bool PartnerCrouch();            // the partner crouches
 // the partner's walk in this level as received, the points after the count 'after' (moved on); gap: some were lost
 int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap);
 uint64_t PartnerPathEnd();
