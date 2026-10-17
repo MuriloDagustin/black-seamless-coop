@@ -9,6 +9,7 @@
 #include <deque>
 
 #include "core/log.h"
+#include "game/coop_npcs.h"
 #include "game/coop_shots.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
@@ -33,6 +34,12 @@ constexpr uint32_t kBulletSize = 0x90;
 constexpr int kBulletCount = 16;
 constexpr uint32_t kBulletLive = 0x88;      // byte
 constexpr uint32_t kBulletDistance = 0x74;  // float: to the hit, or the range
+constexpr float kBodySkip = 0.6f;  // a partner's bullet starts past the partner's body
+constexpr uint32_t kHear = 0x1A22B0;  // eax the noise class, ecx [kAi], edi &pos; the shooter; ret 4
+constexpr uint32_t kNoiseClasses = 0x2D680C;  // [it] + weapon type * 4: the type's noise class
+constexpr uint32_t kNoiseNone = 0x0B;
+constexpr uint32_t kAi = 0x2D1988;
+constexpr uint32_t kCharWeapon = 0x29C;
 constexpr uint32_t kPoolSize = kBullets + kBulletCount * kBulletSize;
 
 // weapon, its gun ('shot') and their data
@@ -67,6 +74,27 @@ constexpr uint32_t kTracer = 0x168E20;  // edx the tracers, bl 1 always drawn; s
 constexpr uint32_t kTracers = 0x2D1990;
 constexpr uint32_t kTracerList = 0x4E2C0;
 
+// the partner's muzzle flash: the 3rd person fire effect of the weapon type (its FX data +0x08/+0x0C) started by
+// 0x169960 on a block of ours whose rows +0x70..+0xAF it follows (locator 8), as the rocket's trail (0x1E3663)
+constexpr uint32_t kSpawnEffect = 0x169960;  // esi the effects; id lo, id hi, owner, mode, locator; ret 0x14
+constexpr uint32_t kEffects = 0x2D1990;
+constexpr uint32_t kEffectsFire = 0x65690;
+constexpr uint32_t kTypeFx = 0x10;   // the type entry's FX data
+constexpr uint32_t kFxThird = 0x08;  // the 3rd person fire effect, lo then hi
+constexpr uint32_t kSilencedLo = 0x6FFEB760, kSilencedHi = 0x97319935;  // MZ_TSUP_V01, as at 0x1DB8BF
+// the partner's gunshot: an AI gun sound slot of ours, positional, bound to the weapon's name
+constexpr uint32_t kSoundRoot = 0x2D0D60;  // +0xD3C8 its table, whose +0x14 is the slots' manager
+constexpr uint32_t kSlotTake = 0x13FB70;   // eax the manager; eax a free slot or 0
+constexpr uint32_t kSlotBind = 0x1457C0;   // eax 0; slot, name lo, name hi, 0x1D; ret 0x10
+constexpr uint32_t kSlotShot = 0x13FC20;   // eax the slot; &pos, hold; ret 8
+constexpr uint32_t kSlotTick = 0x13FC90;   // eax the slot; dt; ret 4
+constexpr uint32_t kManagerSlots = 0x268;  // the slots' array, made with the world (0x145650)
+constexpr uint32_t kSlotSound = 0x58;      // the bound sound set, 0 none
+constexpr uint32_t kSlotState = 0x5C;      // 7 idle
+constexpr uint32_t kSlotUsed = 0x78;       // byte
+constexpr uint32_t kDataHold = 0x20;       // float: the fire interval, how long a shot holds the sound
+constexpr uint32_t kDataAmmo = 0x64;       // the ammo pool
+
 constexpr uint64_t kKeepMs = 500;   // an event not acknowledged by then is given up
 constexpr uint64_t kEchoMs = 3000;  // as coop.cpp's echo of the player
 constexpr uint64_t kLateMs = 250;   // queued longer, play stopped meanwhile: not fired
@@ -97,6 +125,12 @@ struct Ghost {
 };
 Ghost g_ghosts[256];
 uint32_t g_buffers = 0;  // origin, dir, end: 16 aligned vectors
+uint32_t g_flash = 0;    // the block the flash follows, 0xB0 bytes
+// the gunshot slot, the slots' array it came from, the name it is bound to (and the one bound in its stead)
+uint32_t g_slot = 0, g_slot_array = 0;
+bool g_slot_ours = false;  // false once handed to an enemy's gun that found no free one
+bool g_taking = false;     // our own take of a slot
+uint32_t g_bound_lo = 0, g_bound_hi = 0;
 
 uint64_t NowMs() {
     using namespace std::chrono;
@@ -189,6 +223,126 @@ void DropQueue() {
     g_queue.clear();
 }
 
+uint32_t SlotManager() {
+    uint32_t root = R32(kSoundRoot);
+    uint32_t table = root ? R32(root + 0xD3C8) : 0;
+    return table ? R32(table + 0x14) : 0;
+}
+
+// our slot, while the array it came from is still the manager's and the slot ours
+bool SlotValid() {
+    uint32_t mgr = SlotManager();
+    return g_slot && g_slot_ours && mgr && R32(mgr + kManagerSlots) == g_slot_array && G<uint8_t>(g_slot + kSlotUsed);
+}
+
+// the slot reset as 0x1BB010 leaves a slot: idle, nothing playing; used tells whether it stays taken
+void Clear(uint32_t slot, bool used) {
+    std::memset(HostPtr(slot + 0x20), 0, 0x28);
+    W32(slot + kSlotState, 7);
+    W32(slot + kSlotSound, 0);
+    G<uint8_t>(slot + kSlotUsed) = used ? 1 : 0;
+}
+
+// The flash at the muzzle, along the shot: rows right, up, forward, the muzzle (up the world's y)
+void Flash(X86Context& ctx, const Event& e, uint32_t entry) {
+    uint32_t lo = kSilencedLo, hi = kSilencedHi;
+    if (!(e.bits & 1)) {
+        uint32_t fx = R32(entry + kTypeFx);
+        if (!fx) return;
+        lo = R32(fx + kFxThird);
+        hi = R32(fx + kFxThird + 4);
+    }
+    if (!lo && !hi) return;
+    if (!g_flash) g_flash = mem::AllocSystem(0xB0, 16);
+    const Pellet& p = e.pellets[0];
+    float f[3] = {p.dir[0], p.dir[1], p.dir[2]};
+    float right[3] = {f[2], 0, -f[0]};  // up x forward
+    float rl = std::sqrt(right[0] * right[0] + right[2] * right[2]);
+    if (rl < 0.01f) right[0] = 1, right[2] = 0, rl = 1;
+    right[0] /= rl, right[2] /= rl;
+    float up[3] = {f[1] * right[2] - f[2] * right[1], f[2] * right[0] - f[0] * right[2],
+                   f[0] * right[1] - f[1] * right[0]};  // forward x right
+    float rows[16] = {right[0], right[1], right[2], 0, up[0], up[1], up[2], 0,
+                      f[0], f[1], f[2], 0, p.origin[0], p.origin[1], p.origin[2], 1};
+    std::memcpy(HostPtr(g_flash + 0x70), rows, sizeof rows);
+    static constexpr hle::Map kEffectMap =
+        hle::Make({hle::esi, hle::stack, hle::stack, hle::stack, hle::stack, hle::stack});
+    hle::Call(ctx, kSpawnEffect, kEffectMap, {R32(kEffects) + kEffectsFire, lo, hi, g_flash, 1, 8});
+    if (!g_count.flashes++) LOGR("coop: partner muzzle flash %08X:%08X at %.1f %.1f %.1f", hi, lo, double(p.origin[0]),
+                                 double(p.origin[1]), double(p.origin[2]));
+}
+
+// a name the level's AI gun sounds have: the weapon's own, else one of the same ammo pool, else any
+bool Bind(X86Context& ctx, uint32_t lo, uint32_t hi, uint32_t data) {
+    static constexpr hle::Map kBindMap = hle::Make({hle::eax, hle::stack, hle::stack, hle::stack, hle::stack});
+    auto bind = [&](uint32_t l, uint32_t h) {
+        hle::Call(ctx, kSlotBind, kBindMap, {0, g_slot, l, h, 0x1D});
+        return R32(g_slot + kSlotSound) != 0;
+    };
+    if (bind(lo, hi)) return true;
+    uint32_t table = TypeTable();
+    uint32_t n = table ? G<uint8_t>(table + kTypeCount) : 0;
+    uint32_t types = table ? R32(table + kTypes) : 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t entry = types + i * kTypeSize, d = R32(entry + kTypeData);
+            if (!d || (pass == 0 && R32(d + kDataAmmo) != R32(data + kDataAmmo))) continue;
+            if (bind(R32(entry), R32(entry + 4))) return true;
+        }
+    return false;
+}
+
+// The gunshot where the partner fires, as an enemy's gun sounds
+void Gunshot(X86Context& ctx, const Event& e, uint32_t data) {
+    uint32_t mgr = SlotManager();
+    if (!mgr) return;
+    if (!SlotValid()) {
+        static constexpr hle::Map kTakeMap = hle::Make({hle::eax});
+        g_taking = true;
+        g_slot = hle::Call(ctx, kSlotTake, kTakeMap, {mgr});
+        g_taking = false;
+        g_slot_array = R32(mgr + kManagerSlots);
+        g_slot_ours = g_slot != 0;
+        g_bound_lo = g_bound_hi = 0;
+        if (!g_slot) return;  // all of them the enemies' guns': no gunshot this time
+    }
+    if (g_bound_lo != e.id_lo || g_bound_hi != e.id_hi) {
+        static int told;
+        if (!Bind(ctx, e.id_lo, e.id_hi, data) && told++ < 4)
+            LOGR("coop: no gunshot sound for %08X:%08X here", e.id_hi, e.id_lo);
+        g_bound_lo = e.id_lo, g_bound_hi = e.id_hi;
+    }
+    if (!R32(g_slot + kSlotSound)) return;
+    uint32_t pos = g_buffers;
+    std::memcpy(HostPtr(pos), e.pellets[0].origin, 16);
+    static constexpr hle::Map kShotMap = hle::Make({hle::eax, hle::stack, hle::stack});
+    hle::Call(ctx, kSlotShot, kShotMap, {g_slot, pos, R32(data + kDataHold)});
+    g_count.gunshots++;
+    if (g_count.gunshots == 1)
+        LOGR("coop: partner gunshot: slot %08X sound %08X state %u at %.1f %.1f %.1f", g_slot, R32(g_slot + kSlotSound),
+             R32(g_slot + kSlotState), double(e.pellets[0].origin[0]), double(e.pellets[0].origin[1]),
+             double(e.pellets[0].origin[2]));
+}
+
+// the enemies hear the partner's shot as one of the partner's body (0x1A22B0, as the player's fire calls it at
+// 0x1DBE06): the shooter's weapon +0x108 for a silencer, its team for the loudness, the weapon type's noise class
+void Hear(X86Context& ctx, const Event& e, int type) {
+    uint32_t body = coop::npcs::Body(), table = R32(kNoiseClasses), ai = R32(kAi);
+    if (!body || !table || !ai) return;
+    uint32_t noise = R32(table + uint32_t(type) * 4);
+    if (noise == kNoiseNone) return;
+    static uint32_t pos = 0;
+    if (!pos) pos = mem::AllocSystem(16, 16);
+    std::memcpy(HostPtr(pos), e.pellets[0].origin, 16);
+    uint32_t weapon = R32(body + kCharWeapon);
+    uint8_t silenced = weapon ? G<uint8_t>(weapon + kWeaponSilenced) : 0;
+    if (weapon) G<uint8_t>(weapon + kWeaponSilenced) = e.bits & 1;
+    static constexpr hle::Map kHearMap = hle::Make({hle::eax, hle::ecx, hle::edi, hle::stack});
+    hle::Call(ctx, kHear, kHearMap, {noise, ai, pos, body});
+    if (weapon) G<uint8_t>(weapon + kWeaponSilenced) = silenced;
+    g_count.heard++;
+}
+
 // the partner's pellets of one event, from its origin, into our pool. A straight player bullet draws no tracer of its
 // own; ours goes from the muzzle to the first wall the spawn found ahead (a character in between is hit later)
 void Fire(X86Context& ctx, const Event& e) {
@@ -203,6 +357,10 @@ void Fire(X86Context& ctx, const Event& e) {
     Own(*ghost);
     G<uint8_t>(ghost->weapon + kWeaponSilenced) = e.bits & 1;
     G<uint8_t>(ghost->weapon + kWeaponScoped) = (e.bits >> 1) & 1;
+    // the trigger's pull: its flash and its sound, once, then each pellet
+    Flash(ctx, e, R32(ghost->weapon + kWeaponEntry));
+    Gunshot(ctx, e, R32(ghost->weapon + kWeaponData));
+    Hear(ctx, e, type);
     uint32_t origin = g_buffers, dir = g_buffers + 16, end = g_buffers + 32;
     static constexpr hle::Map kSpawnMap =
         hle::Make({hle::ecx, hle::edx, hle::stack, hle::stack, hle::stack, hle::stack, hle::stack});
@@ -216,11 +374,16 @@ void Fire(X86Context& ctx, const Event& e) {
             return;
         }
         const Pellet& p = e.pellets[i];
-        std::memcpy(HostPtr(origin), p.origin, 16);
+        // out of the partner's body here first: it stands at the partner's eye
+        float skip = coop::npcs::Body() && e.range > kBodySkip * 2 ? kBodySkip : 0.0f;
+        float from[4] = {p.origin[0] + p.dir[0] * skip, p.origin[1] + p.dir[1] * skip, p.origin[2] + p.dir[2] * skip,
+                         p.origin[3]};
+        float range = e.range - skip;
+        std::memcpy(HostPtr(origin), from, 16);
         std::memcpy(HostPtr(dir), p.dir, 16);
         g_replaying = true;
         uint32_t spawned = hle::Call(ctx, kSpawn, kSpawnMap,
-                                     {origin, g_pool, ghost->gun, dir, std::bit_cast<uint32_t>(e.range),
+                                     {origin, g_pool, ghost->gun, dir, std::bit_cast<uint32_t>(range),
                                       std::bit_cast<uint32_t>(e.speed), e.flags}) & 0xFF;
         g_replaying = false;
         if (!spawned) {
@@ -230,20 +393,30 @@ void Fire(X86Context& ctx, const Event& e) {
         if (!g_count.fired++) LOGR("coop: first partner bullet fired, type %d", type);
         float reach = G<float>(slot + kBulletDistance);
         if (!std::isfinite(reach) || reach <= 0) continue;  // the muzzle on a wall: nothing to draw
+        reach += skip;
         float to[4] = {p.origin[0] + p.dir[0] * reach, p.origin[1] + p.dir[1] * reach,
                        p.origin[2] + p.dir[2] * reach, p.origin[3]};
+        std::memcpy(HostPtr(origin), p.origin, 16);
         std::memcpy(HostPtr(end), to, 16);
         hle::Call(ctx, kTracer, kTracerMap, {R32(kTracers) + kTracerList, 1, origin, end});
     }
 }
 
 // our pool, as 0x1E28C0 steps the game's
+bool g_stepping = false;
+
 void Step(X86Context& ctx, float dt) {
     static constexpr hle::Map kStepMap = hle::Make({hle::eax, hle::stack});
     for (const Ghost& g : g_ghosts)
         if (g.weapon) Own(g);
+    if (SlotValid()) {
+        static constexpr hle::Map kTickMap = hle::Make({hle::eax, hle::stack});
+        hle::Call(ctx, kSlotTick, kTickMap, {g_slot, std::bit_cast<uint32_t>(dt)});
+    }
+    g_stepping = true;  // their hits and kills are the partner's
     for (int b = 0; b < kBulletCount; b++)
         if (G<uint8_t>(Bullet(b) + kBulletLive)) hle::Call(ctx, kStep, kStepMap, {Bullet(b), std::bit_cast<uint32_t>(dt)});
+    g_stepping = false;
 }
 
 }  // namespace
@@ -309,6 +482,8 @@ void Echo(uint64_t now) {
     }
 }
 
+bool SteppingPartner() { return g_stepping; }
+
 bool GhostWeapon(uint32_t weapon) {
     if (!weapon) return false;
     for (const Ghost& g : g_ghosts)
@@ -317,6 +492,13 @@ bool GhostWeapon(uint32_t weapon) {
 }
 
 const Counters& Count() { return g_count; }
+
+void Gunshot(uint32_t& slot, uint32_t& sound, uint32_t& state) {
+    bool valid = SlotValid();
+    slot = valid ? g_slot : 0;
+    sound = valid ? R32(g_slot + kSlotSound) : 0;
+    state = valid ? R32(g_slot + kSlotState) : 0;
+}
 
 }  // namespace coop::shots
 
@@ -404,12 +586,30 @@ X86_FUNC(sub_001E28C0) {
     __imp__sub_001E28C0(ctx, base);
 }
 
+// An AI gun's sound slot taken (eax the manager, plain ret; eax the slot or 0, as the gun init 0x1C280C asks): when
+// none is free and the partner's gunshot holds one, the enemy's gun has ours, as it would have without co-op
+X86_EXTERN_FUNC(__imp__sub_0013FB70);
+X86_FUNC(sub_0013FB70) {
+    __imp__sub_0013FB70(ctx, base);
+    if (ctx.eax || g_taking || !SlotValid()) return;
+    Clear(g_slot, true);
+    ctx.eax = g_slot;
+    g_slot = 0;
+    g_slot_ours = false;
+    g_bound_lo = g_bound_hi = 0;
+}
+
 // The level loader's bullet reset, esi the armoury, plain ret; its one call is 0x1EDE4C. Ours go with the game's.
 X86_EXTERN_FUNC(__imp__sub_001CEED0);
 X86_FUNC(sub_001CEED0) {
     __imp__sub_001CEED0(ctx, base);
     if (g_pool)
         for (int b = 0; b < kBulletCount; b++) G<uint8_t>(Bullet(b) + kBulletLive) = 0;
+    // the gunshot's slot given back: its sound set is of the level left
+    if (SlotValid()) Clear(g_slot, false);
+    g_slot = 0;
+    g_slot_ours = false;
+    g_bound_lo = g_bound_hi = 0;
     DropQueue();
     coop::world::LevelReset();
 }

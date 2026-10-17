@@ -20,6 +20,7 @@
 #include "game/coop.h"
 #include "game/coop_control.h"
 #include "game/coop_net.h"
+#include "game/coop_npcs.h"
 #include "game/coop_shots.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
@@ -57,8 +58,8 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 7;
-enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents };
+constexpr uint16_t kProtocol = 10;
+enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap };
 
 #pragma pack(push, 1)
 struct Header {
@@ -119,6 +120,14 @@ uint32_t g_seq = 0, g_rx_seq = 0, g_sim_frame = 0;
 uint64_t g_last_rx = 0, g_last_tx = 0, g_last_hello = 0;
 State g_remote{};
 State g_local{};
+// the partner's walk as it came, for the triggers: each state of its in a level, oldest dropped
+struct PathPoint {
+    float feet[3];
+    int8_t level;
+};
+constexpr uint64_t kPathSize = 256;
+PathPoint g_path[kPathSize];
+uint64_t g_path_count = 0;
 struct Echo {
     uint64_t at;
     State state;
@@ -216,10 +225,21 @@ void Receive(uint64_t now) {
                 if (n == int(sizeof(State)) && Finite(in.state) && int32_t(in.h.seq - g_rx_seq) > 0) {
                     g_remote = in.state;
                     g_rx_seq = in.h.seq;
+                    if (in.state.in_level) {
+                        PathPoint& pp = g_path[g_path_count % kPathSize];
+                        std::memcpy(pp.feet, in.state.feet, sizeof pp.feet);
+                        pp.level = in.state.level;
+                        g_path_count++;
+                    }
                     shots::Acked(in.state.shot_ack);
                     world::Acked(in.state.world_ack);
                     world::PartnerLoad(in.state.load, in.state.load_level);
                 }
+                break;
+            case kNpcSnap:
+                if (n >= int(sizeof(Shots)))
+                    npcs::OnSnapshot(in.raw + sizeof(Shots), n - int(sizeof(Shots)), in.shots.count,
+                                     int8_t(in.shots.pad[0]), now);
                 break;
             case kWorldEvents:
                 if (n >= int(sizeof(Shots))) {
@@ -285,6 +305,17 @@ void Send(uint64_t now) {
     State s;
     Sample(s, now);
     net::Send(g_peer, &s, sizeof s);
+    // the host's living enemies, latest wins
+    n = npcs::Snapshot(out.raw + sizeof(Shots), kMaxDatagram - int(sizeof(Shots)), bytes);
+    uint32_t world = R32(kWorld);
+    if (world && s.in_level) {  // a paused host sends none: its puppets stand
+        out.shots.h = Make(kNpcSnap, now);
+        out.shots.ack = 0;
+        out.shots.count = uint8_t(n);
+        std::memset(out.shots.pad, 0, sizeof out.shots.pad);
+        out.shots.pad[0] = uint8_t(world ? G<int8_t>(world + kWorldLevel) : int8_t(-1));
+        if (g_cfg.role == Role::Host) net::Send(g_peer, out.raw, int(sizeof(Shots)) + bytes);
+    }
 }
 
 // the echo: this copy's own player of kEchoMs ago stands in for a partner
@@ -325,6 +356,23 @@ bool Active() { return g_net || g_cfg.echo || g_cfg.probe || control::Enabled();
 
 bool InPlay() { return Live(); }
 
+int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap) {
+    uint64_t first = g_path_count > kPathSize ? g_path_count - kPathSize : 0;
+    gap = after < first;
+    if (gap) after = first;
+    uint32_t world = R32(kWorld);
+    int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
+    int n = 0;
+    while (after < g_path_count && n < max) {
+        const PathPoint& p = g_path[after % kPathSize];
+        after++;
+        if (p.level == level) std::memcpy(out[n++], p.feet, 12);
+    }
+    return n;
+}
+
+uint64_t PartnerPathEnd() { return g_path_count; }
+
 const float* PartnerForward() { return g_remote.view[kRowForward]; }
 
 bool PartnerFeet(float out[3]) {
@@ -334,6 +382,11 @@ bool PartnerFeet(float out[3]) {
     std::memcpy(out, g_remote.feet, 12);
     return true;
 }
+bool PartnerInLevel() {
+    uint32_t world = R32(kWorld);
+    return g_net && world && Live() && NowMs() - g_last_rx <= kTimeoutMs && g_remote.level == G<int8_t>(world + kWorldLevel);
+}
+bool HostHeard() { return g_net && g_cfg.role == Role::Join && g_welcomed && NowMs() - g_last_rx <= kTimeoutMs; }
 bool Networked() { return g_net; }
 
 void Init() {
@@ -359,7 +412,8 @@ void Init() {
     }
     shots::SetMode(false, g_cfg.echo);
     world::SetMode(false, 0);
-    int world_stage = 2;  // --coop-world 1: deaths only; 0: no world sync
+    // --coop-world 4: no partner's body; 3: no host enemies; 2: deaths and triggers; 1: deaths only; 0: no world sync
+    int world_stage = 5;
     if (net::Arg("--coop-world", v) && !v.empty()) world_stage = std::atoi(v.c_str());
     if (g_cfg.role == Role::Off) return;
     if (!net::Open(g_cfg.role == Role::Host ? g_cfg.port : 0)) return;  // WSAStartup, before any name lookup
@@ -375,6 +429,8 @@ void Init() {
     g_net = true;
     shots::SetMode(true, false);
     world::SetMode(true, world_stage);
+    npcs::SetMode(g_cfg.role == Role::Host && world_stage >= 4, g_cfg.role == Role::Join && world_stage >= 4,
+                  world_stage >= 5);
     LOGR("coop: world sync stage %d", world_stage);
     if (g_cfg.role == Role::Host) LOGR("coop: host on UDP %u", g_cfg.port);
     else LOGR("coop: joining %s", net::Text(g_peer).c_str());

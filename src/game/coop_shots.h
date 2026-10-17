@@ -46,13 +46,19 @@ void Reset();      // a new partner session: its count starts again
 void Echo(uint64_t now);  // the echo: this copy's own shots come back after a while
 
 bool GhostWeapon(uint32_t weapon);  // a weapon the partner's bullets fire with, not one of the game's
+bool SteppingPartner();             // the partner's bullets are stepped (their hits are the partner's)
 
 struct Counters {
     uint32_t sent = 0;      // events made here
     uint32_t taken = 0;     // events from the partner
     uint32_t fired = 0;     // their pellets fired here
     uint32_t dropped = 0;   // pellets not fired: no room, another level, not in play
+    uint32_t flashes = 0;   // muzzle flashes started at the partner's gun
+    uint32_t gunshots = 0;  // gunshots played there
+    uint32_t heard = 0;     // shots the enemies were told of
 };
+// the gunshot slot: its address, its bound sound set and state (0 when there is none)
+void Gunshot(uint32_t& slot, uint32_t& sound, uint32_t& state);
 const Counters& Count();
 
 }  // namespace coop::shots

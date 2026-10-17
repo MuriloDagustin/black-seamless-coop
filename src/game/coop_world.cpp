@@ -12,6 +12,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <deque>
 #include <unordered_map>
@@ -20,6 +21,8 @@
 #include "core/log.h"
 #include "game/coop.h"
 #include "game/coop_control.h"
+#include "game/coop_npcs.h"
+#include "game/coop_shots.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
@@ -58,8 +61,36 @@ constexpr uint32_t kTriggerArmed = 0x11C;      // byte
 constexpr uint32_t kTriggerMode = 0x120;       // 0 one shot, 1 2 enter exit, 3 continuous, 4 visibility
 constexpr uint32_t kTriggerAction = 0x124;     // 0 Fire, 1 activate the next unit, 2 advance the unit
 constexpr float kWalkMax = 3.0f;               // farther between two of the partner's tests is a jump
+// props: the loaded units' slots (world+0x49D0, two of 0x880), their arrays of kind 3 and kind 4 props
+constexpr uint32_t kUnitSlots = 0x49D0, kUnitSlotSize = 0x880;
+constexpr uint32_t kSlotLoaded = 0x1C;  // the slot's state +0 of a loaded unit
+constexpr uint32_t kSlotActive = 0x38;  // a byte: the unit activated
+constexpr uint32_t kFrameCount = 0x2F4368;
+constexpr uint32_t kSlotUnit = 0x08, kSlotTriggers = 0x48;  // its unit, its triggers (a list of the manager's)
+constexpr uint32_t kWorldUnit = 0x5AF0;                     // the current unit
+constexpr uint32_t kSlotProps3 = 0x18, kSlotCount3 = 0x30, kProp3Size = 0x1D0;
+constexpr uint32_t kSlotProps4 = 0x1C, kSlotCount4 = 0x34, kProp4Size = 0x200;
+constexpr uint32_t kPropDef = 0x118, kDefStates = 0x48;  // the definition, its states of 0xD0
+constexpr uint32_t kStateSize = 0xD0, kStateNext = 0xCC, kStateFlags = 0x5A;  // next int16; flags 1 2: damage breaks it
+constexpr uint32_t kProp3State = 0x1A4, kProp3Health = 0x1A0;  // the state index, -1 destroyed
+constexpr uint32_t kProp4Part = 0x1A0, kProp4Parts = 0x1F5;    // parts of 12: health, state; their count, a byte
+constexpr uint32_t kPropDamage3 = 0x1E8C50;  // esi the prop; damage; ret 4
+constexpr uint32_t kPropChange3 = 0x1E3DB0;  // eax the prop; to destroyed, 0; ret 8
+constexpr uint32_t kPropDamage4 = 0x1E5070;  // eax the prop; part, damage, from a blast; ret 0xC
+constexpr uint32_t kPropChange4 = 0x1E4B80;  // eax the prop; part, to destroyed; ret 8
+constexpr size_t kPropsMax = 1024;
+// projectiles: [0x2D1998] makes them; side 3 the player's, 1 its team's AI, 0 the enemy's
+constexpr uint32_t kProjectiles = 0x2D1998;
+constexpr uint32_t kThrowGrenade = 0x1DCE60;  // edi the maker; &matrix, &velocity, side; ret 0xC
+constexpr uint32_t kFireRocket = 0x1E35F0;    // ecx the maker, edi the side; &matrix, &velocity, fx lo, fx hi; ret 0x10
+constexpr uint32_t kThrowHand = 0x1DD000;     // a thrown hand grenade (0x1E32A0): edi the maker; &matrix, &velocity, side, flag; ret 0x10
+constexpr uint32_t kPlayerSide = 3, kAllySide = 1;
+constexpr uint64_t kProjectileLateMs = 400;
 
 constexpr uint32_t kDie = 0x205C60;  // eax noise class; mgr, victim, part, &dir, dmg, instigator; ret 0x18
+constexpr uint32_t kMeleeHit = 0x1DFA90;  // thiscall ecx the victim; 0, &dir, 0, the attacker; ret 0x10
+constexpr uint32_t kScoreKill = 0x1FF640;  // esi the player's stats [0x2D12CC] (+4 the kill's kind); plain ret
+constexpr uint32_t kStats = 0x2D12CC;
 constexpr uint32_t kDeathMgr = 0x2D19B0;
 // noise classes: [kClassOfType][weapon type] is a type's, kTypeOfClass a class's type (0xFF none, as class 0)
 constexpr uint32_t kClassOfType = 0x2D680C;
@@ -73,9 +104,12 @@ constexpr uint32_t kRetryFrames = 120;
 constexpr size_t kWaitingMax = 256;
 constexpr int kProbeLines = 1500;
 
-enum Type : uint8_t { kDeath = 1 };
+enum Type : uint8_t { kDeath = 1, kProp, kProjectile, kMelee };
 
 #pragma pack(push, 1)
+// A death names the spawner and carries the killing hit. A prop's state (kProp) puts the prop's id in name, its
+// kind (3, 4) in hit, the part (0xFF for kind 3) in part, the state index (int16, -1 destroyed) in ordinal and the
+// health in dmg. A projectile (kProjectile) has its own fields at the end.
 struct Event {
     uint32_t seq;
     uint32_t ack;  // the last of the receiver's events its sender had taken when it made this one
@@ -85,12 +119,23 @@ struct Event {
     uint8_t part;
     uint32_t name_lo, name_hi;
     uint16_t ordinal;  // the sender's count of the spawner's characters, this one included: for the log
-    uint8_t hit;       // 1: part, dir, dmg and noise are the killing hit's
+    uint8_t hit;       // 1: part, dir, dmg and noise are the killing hit's; 2: the receiver's player killed it
     uint8_t noise;     // its noise class
     float dir[4];
     float dmg;
+    // a projectile's own, sent with a projectile only
+    uint8_t proj_kind;  // 0 grenade (0x1DCE60), 1 rocket (0x1E35F0), 2 hand grenade (0x1DD000)
+    uint8_t proj_side;
+    uint16_t age;  // ms it waited on its sender before this datagram
+    uint32_t fx_lo, fx_hi;  // the rocket's trail
+    float matrix[16];
+    float vel[4];
 };
 #pragma pack(pop)
+
+// a death's or a prop's, on the wire: the event up to the projectile's fields
+constexpr int kHeadSize = int(offsetof(Event, proj_kind));
+int WireSize(uint8_t type) { return type == kProjectile ? int(sizeof(Event)) : kHeadSize; }
 
 struct Npc {
     uint32_t ch = 0;
@@ -99,6 +144,7 @@ struct Npc {
     bool alive = false;
     bool remote = false;  // dying by the partner's word: not sent back
     bool hit = false;
+    bool partner = false;  // killed by the partner's bullets stepped here
     uint8_t part = 0;
     uint8_t noise = 0;
     float dir[4] = {};
@@ -130,6 +176,31 @@ uint32_t g_taken = 0;
 int g_partner_load = -1;          // the partner's level loads, and the level of its last
 int8_t g_partner_level = -1;
 std::vector<Waiting> g_waiting;  // deaths of enemies not spawned here yet, or not ready to die
+std::vector<Event> g_props;      // the partner's prop states for props not loaded here yet
+bool g_props_retry = false;      // a unit was activated: its props may be there now
+struct Arrived {
+    uint64_t at;
+    Event e;
+};
+std::deque<Arrived> g_projectiles;  // to fire on the next step, if not late
+bool g_rocket_replay = false;       // a partner's rocket made here: launched as the player's (0x1DDA70 bl 0)
+// the last state sent of each prop (by id, kind and part): a change to the same is not sent again
+struct PropKey {
+    uint32_t lo, hi;
+    uint8_t kind, part;
+    bool operator==(const PropKey&) const = default;
+};
+struct PropKeyHash {
+    size_t operator()(const PropKey& k) const {
+        return std::hash<uint64_t>()(uint64_t(k.lo) | uint64_t(k.hi) << 32) ^ (size_t(k.kind) << 8 | k.part);
+    }
+};
+struct PropSent {
+    int16_t state;
+    float health;
+    uint32_t frame;
+};
+std::unordered_map<PropKey, PropSent, PropKeyHash> g_props_sent;
 
 // this copy's characters, its spawns of each spawner, and its last death sent of each
 Npc g_npcs[kChars];
@@ -180,20 +251,29 @@ uint32_t NoiseClass(uint32_t wanted) {
     return usable(fallback) ? fallback : 0;
 }
 
-void Send(const Npc& n) {
-    Event e{};
+// an event of this copy's to the partner: numbered, stamped with what this copy has taken, its level and load
+void Post(Event& e) {
     e.seq = ++g_seq;
     e.ack = g_taken;
-    g_own[n.name] = e.seq;
-    e.type = kDeath;
     uint32_t world = R32(kWorld);
     e.level = world ? G<int8_t>(world + kWorldLevel) : -1;
     e.load = g_load;
+    g_pending.push_back({NowMs(), e});
+    if (g_pending.size() > kPendingMax) {
+        g_pending.pop_front();
+        g_count.lost++;
+    }
+    g_count.sent++;
+}
+
+void Send(const Npc& n) {
+    Event e{};
+    e.type = kDeath;
     e.name_lo = uint32_t(n.name);
     e.name_hi = uint32_t(n.name >> 32);
     e.ordinal = n.ordinal;
     if (n.hit) {
-        e.hit = 1;
+        e.hit = n.partner ? 3 : 1;
         e.part = n.part;
         e.noise = n.noise;
         std::memcpy(e.dir, n.dir, sizeof e.dir);
@@ -204,12 +284,8 @@ void Send(const Npc& n) {
         e.dir[3] = 0;
         e.dmg = 100;
     }
-    g_pending.push_back({NowMs(), e});
-    if (g_pending.size() > kPendingMax) {
-        g_pending.pop_front();
-        g_count.lost++;
-    }
-    g_count.sent++;
+    Post(e);
+    g_own[n.name] = e.seq;
 }
 
 // a death on this copy: the partner's enemy too, unless the partner said so first; a cull is this copy's own
@@ -219,7 +295,8 @@ void Died(uint32_t ch, const char* how) {
     Npc& n = g_npcs[s];
     if (n.ch != ch || !n.alive) return;
     n.alive = false;
-    bool send = g_net && g_stage >= 1 && !g_applying && !g_culling && !n.remote && n.name;
+    coop::npcs::Died(n.name);
+    bool send = g_net && g_stage >= 1 && !g_applying && !g_culling && !n.remote && n.name && !coop::npcs::IsBody(ch);
     PROBE("npc- s%d %016llX #%u %s%s", s, (unsigned long long)n.name, n.ordinal, how,
           g_applying ? " (partner's)" : g_culling ? " (culled)" : send ? " sent" : "");
     if (send) Send(n);
@@ -233,12 +310,14 @@ Npc* LiveOf(uint64_t name) {
 
 enum class Result { Done, Later, Wait, Stale };
 
+bool Finite(const float* v, int n);
+
 Result Kill(X86Context& ctx, Npc& n, const Event& e) {
     uint32_t ch = n.ch;
     if (R32(ch + kCharState) != 0) return Result::Done;  // dying here already
     uint32_t control = R32(ch + kCharControl);
     if (!control || R32(control + kControlActive) != 1) return Result::Later;
-    uint32_t noise = NoiseClass(e.hit ? e.noise : 0);
+    uint32_t noise = NoiseClass(e.hit & 1 ? e.noise : 0);
     if (!noise) return Result::Later;
     if (!g_dir) g_dir = mem::AllocSystem(16, 16);
     float dir[4] = {e.dir[0], e.dir[1], e.dir[2], 0};
@@ -252,6 +331,13 @@ Result Kill(X86Context& ctx, Npc& n, const Event& e) {
     static constexpr hle::Map kDieMap =
         hle::Make({hle::eax, hle::stack, hle::stack, hle::stack, hle::stack, hle::stack, hle::stack});
     g_applying = true;
+    // this copy's player killed it with its bullets there: its kill, as TakeDamage scores one (0x1E796D)
+    uint32_t stats = R32(kStats);
+    if ((e.hit & 2) && stats) {
+        static constexpr hle::Map kScoreMap = hle::Make({hle::esi});
+        hle::Call(ctx, kScoreKill, kScoreMap, {stats});
+        W32(stats + 4, 0);
+    }
     hle::Call(ctx, kDie, kDieMap, {noise, R32(kDeathMgr), ch, e.part, g_dir, std::bit_cast<uint32_t>(dmg), Player()});
     g_applying = false;
     g_count.applied++;
@@ -266,17 +352,220 @@ Result Apply(X86Context& ctx, const Event& e) {
     auto own = g_own.find(name);
     if (own != g_own.end() && int32_t(own->second - e.ack) > 0) return Result::Stale;
     if (Npc* live = LiveOf(name)) return Kill(ctx, *live, e);
+    // the host's enemies are puppets here: one not made here is gone, the next of its spawner another
+    if (coop::npcs::Puppets()) {
+        coop::npcs::Died(name);
+        return Result::Stale;
+    }
     return Result::Wait;  // not made here yet, or removed and to come again
+}
+
+// the joining player's melee on the host's enemy: its hit there, by the joining player's body
+Result ApplyMelee(X86Context& ctx, const Event& e) {
+    uint32_t ch = LiveCharacter(Name(e.name_lo, e.name_hi));
+    if (!ch) return Result::Stale;
+    if (!g_dir) g_dir = mem::AllocSystem(16, 16);
+    float dir[4] = {e.dir[0], e.dir[1], e.dir[2], 0};
+    if (!Finite(dir, 3)) return Result::Stale;
+    std::memcpy(HostPtr(g_dir), dir, 16);
+    uint32_t by = coop::npcs::Body();
+    static constexpr hle::Map kMeleeMap = hle::Make({hle::ecx, hle::stack, hle::stack, hle::stack, hle::stack});
+    g_applying = true;
+    hle::Call(ctx, kMeleeHit, kMeleeMap, {ch, 0, g_dir, 0, by ? by : Player()});
+    g_applying = false;
+    g_count.applied++;
+    PROBE("melee! %08X%08X by the partner", e.name_hi, e.name_lo);
+    return Result::Done;
 }
 
 // the partner loaded that level again: its enemies there live again, its deaths of before are void
 void DropOld(uint8_t load, int8_t level) {
+    auto old = [&](const Event& e) { return e.level == level && e.load != load; };
     std::erase_if(g_waiting, [&](const Waiting& w) {
-        bool old = w.e.level == level && w.e.load != load;
-        if (old) g_count.lost++;
-        return old;
+        if (old(w.e)) g_count.lost++;
+        return old(w.e);
     });
+    std::erase_if(g_props, [&](const Event& e) { return old(e); });
 }
+
+// --- props: a state change on one copy is played on the other where it is behind; a state only goes on along
+// its chain (state +0xCC the next, -1 destroyed), so the most broken wins and the two meet
+
+int16_t Next(uint32_t prop, int16_t state) {
+    if (state < 0) return -1;
+    uint32_t states = R32(R32(prop + kPropDef) + kDefStates);
+    return int16_t(G<int16_t>(states + uint32_t(state) * kStateSize + kStateNext));
+}
+
+// target on from here along the chain: this copy is behind
+bool Behind(uint32_t prop, int16_t here, int16_t target) {
+    if (here == target || here < 0) return false;
+    if (target < 0) return true;
+    for (int i = 0, s = here; i < 16 && s >= 0; i++) {
+        s = Next(prop, int16_t(s));
+        if (s == target) return true;
+    }
+    return false;
+}
+
+// a prop by its id in this copy's loaded and active units, 0 when not in one here. A unit loaded ahead and not
+// active yet has its props set up on its activation (0x1EB440: their vf18 resets them), one unloading still lists
+// its old ones
+uint32_t FindProp(uint32_t lo, uint32_t hi, uint8_t kind) {
+    uint32_t world = R32(kWorld);
+    if (!world) return 0;
+    for (uint32_t slot = 0; slot < 2; slot++) {
+        uint32_t s = world + kUnitSlots + slot * kUnitSlotSize;
+        if (R32(s) != kSlotLoaded || !G<uint8_t>(s + kSlotActive)) continue;  // 0x1EB445, 0x1EB683, 0x1EB42E
+        uint32_t array = R32(s + (kind == 3 ? kSlotProps3 : kSlotProps4));
+        uint32_t n = R32(s + (kind == 3 ? kSlotCount3 : kSlotCount4));
+        uint32_t stride = kind == 3 ? kProp3Size : kProp4Size;
+        if (!array || n > 4096) continue;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t p = array + i * stride;
+            if (R32(p + 0x08) == lo && R32(p + 0x0C) == hi) return p;
+        }
+    }
+    return 0;
+}
+
+// the state and health of a kind 3 prop, or of a part of a kind 4 one
+bool PropState(uint32_t p, uint8_t kind, uint8_t part, int16_t& state, float& health) {
+    if (kind == 3) {
+        state = int16_t(int32_t(R32(p + kProp3State)));
+        health = G<float>(p + kProp3Health);
+        return true;
+    }
+    if (part >= G<uint8_t>(p + kProp4Parts)) return false;
+    uint32_t entry = R32(p + kProp4Part) + uint32_t(part) * 12;
+    health = G<float>(entry);
+    state = int16_t(int32_t(R32(entry + 4)));
+    return true;
+}
+
+enum class PropResult { Done, Absent };
+
+// the partner's state played here: damage enough to break this state, as a hit would, so its effects, model, debris,
+// listeners and a barrel's blast all come; the state change itself when the state takes no damage
+PropResult ApplyProp(X86Context& ctx, const Event& e) {
+    uint8_t kind = e.hit, part = e.part;
+    int16_t target = int16_t(e.ordinal);
+    uint32_t p = FindProp(e.name_lo, e.name_hi, kind);
+    if (!p) return PropResult::Absent;
+    static constexpr hle::Map kDamage3 = hle::Make({hle::esi, hle::stack});
+    static constexpr hle::Map kChange3 = hle::Make({hle::eax, hle::stack, hle::stack});
+    static constexpr hle::Map kDamage4 = hle::Make({hle::eax, hle::stack, hle::stack, hle::stack});
+    static constexpr hle::Map kChange4 = hle::Make({hle::eax, hle::stack, hle::stack});
+    for (int step = 0; step < 8; step++) {
+        int16_t here;
+        float health;
+        if (!PropState(p, kind, part, here, health) || !Behind(p, here, target)) break;
+        uint32_t states = R32(R32(p + kPropDef) + kDefStates);
+        uint8_t flags = G<uint8_t>(states + uint32_t(here) * kStateSize + kStateFlags);
+        uint32_t dmg = std::bit_cast<uint32_t>(std::max(health, 0.0f) + 1.0f);
+        g_applying = true;
+        if (flags & 3) {
+            if (kind == 3) hle::Call(ctx, kPropDamage3, kDamage3, {p, dmg});
+            else hle::Call(ctx, kPropDamage4, kDamage4, {p, part, dmg, 0});
+        }
+        int16_t now;
+        PropState(p, kind, part, now, health);
+        if (now == here) {  // no damage taken in this state: the change itself
+            uint32_t to_destroyed = target < 0 ? 1 : 0;
+            if (kind == 3) hle::Call(ctx, kPropChange3, kChange3, {p, to_destroyed, 0});
+            else hle::Call(ctx, kPropChange4, kChange4, {p, part, to_destroyed});
+            PropState(p, kind, part, now, health);
+        }
+        g_applying = false;
+        if (now == here) break;
+        g_count.props++;
+        PROBE("prop! %08X%08X k%u p%d %d -> %d (partner's %d)", e.name_hi, e.name_lo, kind, part == 0xFF ? -1 : part,
+              here, now, target);
+    }
+    return PropResult::Done;
+}
+
+// --- projectiles: the player's grenades and rockets fired again on the partner's copy, the partner an ally there
+
+void FireProjectile(X86Context& ctx, const Event& e) {
+    // the partner's player's as an ally's; the host's enemy's as an enemy's (0)
+    uint32_t side = e.proj_side == kPlayerSide ? kAllySide : 0;
+    static uint32_t matrix = 0, vel = 0;
+    if (!matrix) matrix = mem::AllocSystem(64, 16), vel = mem::AllocSystem(16, 16);
+    std::memcpy(HostPtr(matrix), e.matrix, 64);
+    std::memcpy(HostPtr(vel), e.vel, 16);
+    uint32_t mgr = R32(kProjectiles);
+    if (!mgr) return;
+    g_applying = true;
+    if (e.proj_kind == 0) {
+        static constexpr hle::Map kGrenade = hle::Make({hle::edi, hle::stack, hle::stack, hle::stack});
+        hle::Call(ctx, kThrowGrenade, kGrenade, {mgr, matrix, vel, side});
+    } else if (e.proj_kind == 2) {
+        static constexpr hle::Map kHand = hle::Make({hle::edi, hle::stack, hle::stack, hle::stack, hle::stack});
+        hle::Call(ctx, kThrowHand, kHand, {mgr, matrix, vel, side, e.fx_lo & 0xFF});
+    } else {
+        static constexpr hle::Map kRocket =
+            hle::Make({hle::ecx, hle::edi, hle::stack, hle::stack, hle::stack, hle::stack});
+        g_rocket_replay = true;
+        hle::Call(ctx, kFireRocket, kRocket, {mgr, side, matrix, vel, e.fx_lo, e.fx_hi});
+        g_rocket_replay = false;
+    }
+    g_applying = false;
+    g_count.projectiles++;
+    static const char* kKinds[] = {"grenade", "rocket", "hand grenade"};
+    PROBE("proj! %s of the partner at %.1f %.1f %.1f", kKinds[e.proj_kind % 3], double(e.matrix[12]),
+          double(e.matrix[13]), double(e.matrix[14]));
+}
+
+bool Finite(const float* v, int n) {
+    for (int i = 0; i < n; i++)
+        if (!std::isfinite(v[i])) return false;
+    return true;
+}
+
+// a state change of this copy's own to the partner: a unit's prop, by its id (debris of the pools has none)
+void SendProp(uint32_t p, uint8_t kind, uint8_t part) {
+    if (!g_net || g_stage < 3 || g_applying) return;
+    uint32_t lo = R32(p + 0x08), hi = R32(p + 0x0C);
+    if ((!lo && !hi) || FindProp(lo, hi, kind) != p) return;
+    int16_t state;
+    float health;
+    if (!PropState(p, kind, part, state, health)) return;
+    uint32_t frame = R32(kFrameCount);
+    auto [sent, fresh] = g_props_sent.try_emplace(PropKey{lo, hi, kind, part}, PropSent{state, health, frame});
+    if (!fresh) {
+        // 0x1E3DB0 twice for one change (a state of both flags); a prop reset by its unit's activation and broken
+        // again is a change again
+        bool same = sent->second.state == state && sent->second.health == health && frame - sent->second.frame <= 1;
+        sent->second = {state, health, frame};
+        if (same) return;
+    }
+    Event e{};
+    e.type = kProp;
+    e.ordinal = uint16_t(state);
+    e.dmg = health;
+    e.name_lo = lo, e.name_hi = hi;
+    e.hit = kind;
+    e.part = part;
+    Post(e);
+    PROBE("prop- %08X%08X k%u p%d now %d sent", hi, lo, kind, part == 0xFF ? -1 : part, int16_t(e.ordinal));
+}
+
+void SendProjectile(uint8_t kind, uint32_t side, uint32_t matrix, uint32_t vel, uint32_t fx_lo, uint32_t fx_hi) {
+    Event e{};
+    e.type = kProjectile;
+    e.proj_kind = kind;
+    e.proj_side = uint8_t(side);
+    std::memcpy(e.matrix, HostPtr(matrix), 64);
+    std::memcpy(e.vel, HostPtr(vel), 16);
+    e.fx_lo = fx_lo, e.fx_hi = fx_hi;
+    Post(e);
+    static const char* kKinds[] = {"grenade", "rocket", "hand grenade"};
+    PROBE("proj- %s sent at %.1f %.1f %.1f", kKinds[kind % 3], double(e.matrix[12]), double(e.matrix[13]),
+          double(e.matrix[14]));
+}
+
+bool SendsProjectiles() { return g_net && g_stage >= 3 && !g_applying; }
 
 }  // namespace
 
@@ -300,18 +589,24 @@ int Outgoing(uint8_t* out, int cap, int& bytes, uint64_t now) {
         g_pending.pop_front();
         g_count.lost++;
     }
+    // a projectile not taken by then would come too late to be fired: it goes (the receiver takes any newer)
+    std::erase_if(g_pending, [&](const Stamped& s) { return s.e.type == kProjectile && now - s.at > kProjectileLateMs; });
     int n = 0;
     for (const Stamped& s : g_pending) {
-        if (bytes + int(sizeof(Event)) > cap || n == 255) break;
-        std::memcpy(out + bytes, &s.e, sizeof(Event));
-        bytes += int(sizeof(Event));
+        int size = WireSize(s.e.type);
+        if (bytes + size > cap || n == 255) break;
+        Event e = s.e;
+        e.age = uint16_t(std::min<uint64_t>(now - s.at, 0xFFFF));
+        std::memcpy(out + bytes, &e, size_t(size));
+        bytes += size;
         n++;
     }
     return n;
 }
 
 void Hold(uint64_t now) {
-    // the partner cannot be heard: the events wait for it, their age does not run
+    // the partner cannot be heard: the events wait for it, their age does not run; its projectiles would be late
+    std::erase_if(g_pending, [](const Stamped& s) { return s.e.type == kProjectile; });
     for (Stamped& s : g_pending) s.at = now;
 }
 
@@ -319,18 +614,36 @@ void Acked(uint32_t seq) {
     while (!g_pending.empty() && int32_t(g_pending.front().e.seq - seq) <= 0) g_pending.pop_front();
 }
 
-void Incoming(const uint8_t* p, int bytes, int count, uint64_t) {
-    for (int i = 0; i < count && (i + 1) * int(sizeof(Event)) <= bytes; i++) {
-        Event e;
-        std::memcpy(&e, p + i * sizeof(Event), sizeof(Event));
+void Incoming(const uint8_t* p, int bytes, int count, uint64_t now) {
+    for (int i = 0, at = 0; i < count && at + kHeadSize <= bytes; i++) {
+        Event e{};
+        int size = WireSize(p[at + offsetof(Event, type)]);
+        if (at + size > bytes) break;
+        std::memcpy(&e, p + at, size_t(size));
+        at += size;
         // every datagram starts at the oldest event not acknowledged: newer is the next one
         if (int32_t(e.seq - g_taken) <= 0) continue;
         g_taken = e.seq;
         g_count.taken++;
         PartnerLoad(e.load, e.level);
         bool reloaded = e.level == g_partner_level && e.load != uint8_t(g_partner_load);
-        if (e.type != kDeath || g_stage < 1 || reloaded) {
+        bool wanted = (e.type == kDeath && g_stage >= 1) || ((e.type == kProp || e.type == kProjectile) && g_stage >= 3) ||
+                      (e.type == kMelee && g_stage >= 4);
+        if (!wanted || reloaded) {
             g_count.lost++;  // from before the partner loaded that level again
+            continue;
+        }
+        if (e.type == kProp) {
+            if (g_props.size() >= kPropsMax) g_props.erase(g_props.begin());
+            g_props.push_back(e);
+            g_props_retry = true;
+            continue;
+        }
+        if (e.type == kProjectile) {
+            // its age on the sender counts: the receiver's clock starts on arrival
+            if (Finite(e.matrix, 16) && Finite(e.vel, 4) && e.proj_kind <= 2 && e.age <= kProjectileLateMs)
+                g_projectiles.push_back({now - e.age, e});
+            if (g_projectiles.size() > 32) g_projectiles.pop_front();
             continue;
         }
         if (g_waiting.size() >= kWaitingMax) {
@@ -348,22 +661,39 @@ void Reset() {
     g_partner_load = -1;
     g_partner_level = -1;
     g_waiting.clear();
+    g_props.clear();
+    g_projectiles.clear();
     g_seq = 0;
     g_pending.clear();
     g_own.clear();
+    g_props_sent.clear();
 }
 
 void Tick(X86Context& ctx) {
-    if (g_stage < 1 || g_waiting.empty()) return;
+    if (g_stage < 1) return;
     uint32_t world = R32(kWorld);
     int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
+    // the partner's projectiles, at once or not at all
+    uint64_t now = NowMs();
+    while (!g_projectiles.empty()) {
+        Arrived a = g_projectiles.front();
+        g_projectiles.pop_front();
+        if (a.e.level == level && now - a.at <= kProjectileLateMs) FireProjectile(ctx, a.e);
+        else g_count.lost++;
+    }
+    // the partner's prop states: tried as they come and again when a unit comes in
+    if (g_props_retry) {
+        g_props_retry = false;
+        std::erase_if(g_props, [&](const Event& e) { return e.level == level && ApplyProp(ctx, e) == PropResult::Done; });
+    }
+    if (g_waiting.empty()) return;
     for (size_t i = 0; i < g_waiting.size();) {
         Waiting& w = g_waiting[i];
         if (w.e.level != level) {  // the partner's level, not ours yet: it waits
             i++;
             continue;
         }
-        Result r = Apply(ctx, w.e);
+        Result r = w.e.type == kMelee ? ApplyMelee(ctx, w.e) : Apply(ctx, w.e);
         if (r == Result::Done || r == Result::Stale || (r == Result::Later && ++w.frames > kRetryFrames)) {
             if (r == Result::Stale) g_count.stale++;
             if (r == Result::Later) g_count.lost++;
@@ -380,17 +710,41 @@ void LevelReset() {
     for (Npc& n : g_npcs) n = {};
     g_spawns.clear();
     g_own.clear();
+    g_props_sent.clear();
     uint32_t world = R32(kWorld);
     int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
     // ours of this level, loaded again, are void on the partner; of another level they still stand
     std::erase_if(g_pending, [&](const Stamped& s) { return s.e.level == level; });
     // the partner's of any other level would only meet a later play of it
     std::erase_if(g_waiting, [&](const Waiting& w) { return w.e.level != level; });
+    std::erase_if(g_props, [&](const Event& e) { return e.level != level; });
+    g_projectiles.clear();
+    g_props_retry = true;
+    coop::npcs::LevelReset();
+    coop::control::LevelReset();
     g_level = level;
     g_load++;
 }
 
 int8_t LoadLevel() { return g_level; }
+
+uint32_t LiveCharacter(uint64_t name) {
+    Npc* n = LiveOf(name);
+    return n && R32(n->ch + kCharState) == 0 ? n->ch : 0;
+}
+
+bool Applying() { return g_applying; }
+
+void SendMelee(uint64_t name, uint32_t dir) {
+    if (!g_net || g_stage < 4 || g_applying || !name || !dir) return;
+    Event e{};
+    e.type = kMelee;
+    e.name_lo = uint32_t(name), e.name_hi = uint32_t(name >> 32);
+    std::memcpy(e.dir, HostPtr(dir), 16);
+    e.dir[3] = 0;
+    Post(e);
+    PROBE("melee- %016llX sent", (unsigned long long)name);
+}
 
 const Counters& Count() { return g_count; }
 
@@ -399,39 +753,45 @@ const Counters& Count() { return g_count; }
 // 0x1C9270 sweeps from the player's last position, world+0x1C0, which stands in for the partner's meanwhile.
 // Not tested: the unit triggers (actions 1, 2: the streaming follows this copy's player), the enter and exit ones
 // (modes 1, 2: their inside flag is one player's), the visibility zones (mode 4) and type 12's enter and exit.
-void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
-    static float prev[3];
-    static bool have_prev = false;
-    float feet[3];
-    uint32_t world = R32(kWorld);
-    if (!g_net || g_stage < 2 || !world || !mgr || !coop::PartnerFeet(feet)) {
-        have_prev = false;
-        return;
+namespace {
+
+// a trigger whose outputs set the scene's look for where it stands (type 32 0x1C22E0 writes world+0x5C98, type 31
+// 0x1C2370 world+0x5C90): the partner's place is not this copy's player's, it waits for the player
+bool SetsTheScene(uint32_t t) {
+    uint32_t n = G<uint8_t>(t + 0x14), outputs = R32(t + 0x10);
+    for (uint32_t i = 0; outputs && i < n; i++) {
+        uint32_t o = R32(outputs + i * 4);
+        if (o && (R32(o) == 0x28F0A4 || R32(o) == 0x28F0E0)) return true;
     }
-    // a jump (a teleport, a respawn, packets lost a while) is no walk: only where the partner is now is tested
-    float moved = 0;
-    for (int i = 0; i < 3; i++) moved += (feet[i] - prev[i]) * (feet[i] - prev[i]);
-    if (!have_prev || moved > kWalkMax * kWalkMax) std::memcpy(prev, feet, sizeof prev);
+    return false;
+}
+
+// the one shot triggers of this copy's current unit tested on the way from one of the partner's points to the next:
+// the manager's lists are the two units' (a unit slot's +0x48), the other one's outputs would act on this unit
+void TestPartner(X86Context& ctx, uint32_t mgr, const float from[3], const float to[3]) {
     static uint32_t pos = 0, saved = 0;
-    if (!pos) {
-        pos = mem::AllocSystem(16, 16);
-        saved = mem::AllocSystem(16, 16);
-    }
+    if (!pos) pos = mem::AllocSystem(16, 16), saved = mem::AllocSystem(16, 16);
+    uint32_t world = R32(kWorld);
     uint32_t last = world + kWorldLastPos;
     std::memcpy(HostPtr(saved), HostPtr(last), 16);
-    float w = G<float>(Player() + kPlayerFeet + 12);
-    float at[4] = {feet[0], feet[1], feet[2], w};
-    float from[4] = {prev[0], prev[1], prev[2], G<float>(saved + 12)};
+    float at[4] = {to[0], to[1], to[2], G<float>(Player() + kPlayerFeet + 12)};
+    float start[4] = {from[0], from[1], from[2], G<float>(saved + 12)};
     std::memcpy(HostPtr(pos), at, 16);
-    std::memcpy(HostPtr(last), from, 16);
+    std::memcpy(HostPtr(last), start, 16);
     static constexpr hle::Map kTestMap = hle::Make({hle::ecx, hle::stack, hle::stack});
+    uint32_t unit = R32(world + kWorldUnit);
     for (uint32_t list = 0; list < 2; list++) {
         uint32_t n = G<uint16_t>(mgr + list * 2);
         uint32_t triggers = R32(mgr + kTriggerLists + list * 4);
-        for (uint32_t i = 0; triggers && i < n; i++) {
+        bool current = false;
+        for (uint32_t k = 0; k < 2; k++) {
+            uint32_t s = world + kUnitSlots + k * kUnitSlotSize;
+            if (triggers && R32(s + kSlotTriggers) == triggers && R32(s + kSlotUnit) == unit) current = true;
+        }
+        for (uint32_t i = 0; current && i < n; i++) {
             uint32_t t = R32(triggers + i * 4);
             if (!t || R32(t) != kTriggerVtable || !G<uint8_t>(t + kTriggerArmed)) continue;
-            if (R32(t + kTriggerMode) != 0 || R32(t + kTriggerAction) != 0) continue;
+            if (R32(t + kTriggerMode) != 0 || R32(t + kTriggerAction) != 0 || SetsTheScene(t)) continue;
             uint32_t fired = hle::Call(ctx, R32(R32(t) + kTriggerTest), kTestMap, {t, pos, Player()}) & 0xFF;
             if (!fired) continue;
             G<uint8_t>(t + kTriggerArmed) = 0;  // as the dispatcher disarms it (0x1E8055)
@@ -440,8 +800,39 @@ void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
         }
     }
     std::memcpy(HostPtr(last), HostPtr(saved), 16);
-    std::memcpy(prev, feet, sizeof prev);
-    have_prev = true;
+}
+
+}  // namespace
+
+void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
+    static float prev[3];
+    static bool have_prev = false;
+    static uint64_t after = 0;
+    float feet[3];
+    uint32_t world = R32(kWorld);
+    if (!g_net || g_stage < 2 || !world || !mgr || !coop::PartnerFeet(feet)) {
+        have_prev = false;
+        return;
+    }
+    if (!have_prev) {
+        after = coop::PartnerPathEnd();
+        std::memcpy(prev, feet, sizeof prev);
+        have_prev = true;
+        TestPartner(ctx, mgr, feet, feet);
+        return;
+    }
+    // each received step of the partner's since the last tick, a pause or a hitch of this copy's included;
+    // a step longer than a walk (a teleport, a respawn, lost states) is only tested where it lands
+    float points[64][3];
+    bool gap;
+    int n = coop::PartnerPath(after, points, 64, gap);
+    if (gap && n) std::memcpy(prev, points[0], sizeof prev);
+    for (int i = 0; i < n; i++) {
+        float moved = 0;
+        for (int j = 0; j < 3; j++) moved += (points[i][j] - prev[j]) * (points[i][j] - prev[j]);
+        TestPartner(ctx, mgr, moved > kWalkMax * kWalkMax ? points[i] : prev, points[i]);
+        std::memcpy(prev, points[i], sizeof prev);
+    }
 }
 
 }  // namespace coop::world
@@ -482,6 +873,7 @@ X86_FUNC(sub_00205C60) {
         n.part = uint8_t(R32(ctx.esp + 0xC));
         std::memcpy(n.dir, HostPtr(R32(ctx.esp + 0x10)), 16);
         n.dmg = G<float>(ctx.esp + 0x14);
+        n.partner = coop::shots::SteppingPartner();
     }
     __imp__sub_00205C60(ctx, base);
 }
@@ -503,7 +895,8 @@ X86_FUNC(sub_001DA1A0) {
         int s = SlotOf(ch);
         if (s >= 0 && g_npcs[s].ch == ch && g_npcs[s].alive) {
             g_npcs[s].alive = false;
-            PROBE("npc~ s%d %016llX #%u let go", s, (unsigned long long)g_npcs[s].name, g_npcs[s].ordinal);
+            PROBE("npc~ s%d %016llX #%u let go (from %08X)", s, (unsigned long long)g_npcs[s].name, g_npcs[s].ordinal,
+                  R32(ctx.esp));
         }
     }
     __imp__sub_001DA1A0(ctx, base);
@@ -517,6 +910,69 @@ X86_FUNC(sub_001E7FF0) {
     coop::control::BeforeTriggers();  // a test's "stand": the player in a trigger as the triggers are tested
     __imp__sub_001E7FF0(ctx, base);
     PartnerTriggers(ctx, mgr);
+    coop::npcs::LogicTick(ctx);  // where the spawners' tick would make them: the host's enemies made here
+}
+
+// A kind 3 prop's state change, eax the prop; to destroyed, 0 (ret 8): from its damage 0x1E8C50 and its other hurts
+X86_EXTERN_FUNC(__imp__sub_001E3DB0);
+X86_FUNC(sub_001E3DB0) {
+    uint32_t p = ctx.eax;
+    __imp__sub_001E3DB0(ctx, base);
+    SendProp(p, 3, 0xFF);
+}
+
+// A kind 4 prop's part state change, eax the prop; the part, to destroyed (ret 8)
+X86_EXTERN_FUNC(__imp__sub_001E4B80);
+X86_FUNC(sub_001E4B80) {
+    uint32_t p = ctx.eax;
+    uint8_t part = uint8_t(R32(ctx.esp + 4));
+    __imp__sub_001E4B80(ctx, base);
+    SendProp(p, 4, part);
+}
+
+// A rocket's launch (esi the rocket, eax &velocity, bl 1 for an AI's: its ray starts 5 m out, 0x1DDA79): the
+// partner's rocket replayed here is a player's, its ray from the muzzle, its fx and flags +0x117/+0x118 the player's
+X86_EXTERN_FUNC(__imp__sub_001DDA70);
+X86_FUNC(sub_001DDA70) {
+    if (g_rocket_replay) ctx.ebx &= ~0xFFu;
+    __imp__sub_001DDA70(ctx, base);
+}
+
+// A grenade made, edi the maker; &matrix, &velocity, side (ret 0xC): the player's (side 3) go to the partner
+X86_EXTERN_FUNC(__imp__sub_001DCE60);
+X86_FUNC(sub_001DCE60) {
+    PROBE("grenade made: side %u from %08X", R32(ctx.esp + 0xC), R32(ctx.esp));
+    bool mine = R32(ctx.esp + 0xC) == kPlayerSide && SendsProjectiles();
+    uint32_t matrix = R32(ctx.esp + 4), vel = R32(ctx.esp + 8);
+    if (mine) SendProjectile(0, kPlayerSide, matrix, vel, 0, 0);
+    __imp__sub_001DCE60(ctx, base);
+}
+
+// A hand grenade thrown, edi the maker; &matrix, &velocity, side, a flag byte (ret 0x10): from 0x1E32A0, the throw
+X86_EXTERN_FUNC(__imp__sub_001DD000);
+X86_FUNC(sub_001DD000) {
+    uint32_t side = R32(ctx.esp + 0xC);
+    bool mine = side == kPlayerSide && SendsProjectiles();
+    // an enemy's (side 0) on the host: its puppet on the joining copy throws none of its own
+    bool enemy = side == 0 && g_stage >= 4 && coop::npcs::HostsEnemies() && SendsProjectiles();
+    if (mine || enemy) SendProjectile(2, side, R32(ctx.esp + 4), R32(ctx.esp + 8), R32(ctx.esp + 0x10) & 0xFF, 0);
+    __imp__sub_001DD000(ctx, base);
+}
+
+// A rocket made, ecx the maker, edi the side; &matrix, &velocity, its trail's fx (ret 0x10)
+X86_EXTERN_FUNC(__imp__sub_001E35F0);
+X86_FUNC(sub_001E35F0) {
+    PROBE("rocket made: side %u from %08X", ctx.edi, R32(ctx.esp));
+    bool mine = ctx.edi == kPlayerSide && SendsProjectiles();
+    if (mine) SendProjectile(1, kPlayerSide, R32(ctx.esp + 4), R32(ctx.esp + 8), R32(ctx.esp + 0xC), R32(ctx.esp + 0x10));
+    __imp__sub_001E35F0(ctx, base);
+}
+
+// A unit activated (stdcall, its slot; ret 4): its props are in the slot's arrays now
+X86_EXTERN_FUNC(__imp__sub_001EB440);
+X86_FUNC(sub_001EB440) {
+    __imp__sub_001EB440(ctx, base);
+    g_props_retry = true;
 }
 
 // The cull when the 16 live characters are all taken (0x1E6860) and its kin: each copy culls its own, not sent

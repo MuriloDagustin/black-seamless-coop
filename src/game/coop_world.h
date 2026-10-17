@@ -9,7 +9,8 @@
 
 namespace coop::world {
 
-void SetMode(bool net, int stage);  // stage 0: off; 1: deaths; 2: and the partner fires triggers
+// stage 0: off; 1: deaths; 2: and the partner fires triggers; 3: and props and projectiles
+void SetMode(bool net, int stage);
 uint8_t Load();                     // this copy's level loads so far, for the partner
 int8_t LoadLevel();                 // and the level of the last
 // the partner's, from its packets: a newer load of a level voids the partner's deaths of its earlier loads of it
@@ -26,12 +27,16 @@ uint32_t Taken();
 void Reset();  // a new partner session: both directions start again from 1
 
 void Tick(X86Context& ctx);  // the partner's events applied, once a frame of play
+uint32_t LiveCharacter(uint64_t name);  // this copy's live character of that spawner, 0 none
+bool Applying();                        // inside a call that plays the partner's event
+void SendMelee(uint64_t name, uint32_t dir);  // joining copy: its player's melee on a puppet, for the host's
 void LevelReset();           // the level (re)loads: no enemy is known any more
 // stage 2: the one shot triggers fire for the partner's body too, after the logic tick 0x1E7FF0 of the manager
 void PartnerTriggers(X86Context& ctx, uint32_t mgr);
 
 struct Counters {
     uint32_t sent = 0, taken = 0, applied = 0, waiting = 0, lost = 0, stale = 0, triggers = 0;
+    uint32_t props = 0, projectiles = 0;  // the partner's prop states and projectiles played here
 };
 const Counters& Count();
 

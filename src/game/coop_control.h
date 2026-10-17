@@ -17,5 +17,6 @@ bool Enabled();
 void Poll(X86Context& ctx);            // game thread, each frame: the commands, the aim
 bool Override(int port, input::Pad& pad);  // the pad thread: true when the channel gives the pad
 void BeforeTriggers();  // game thread, before the logic tick 0x1E7FF0 tests the triggers
+void LevelReset();      // a level (re)loads: nothing of the old one is held
 
 }  // namespace coop::control

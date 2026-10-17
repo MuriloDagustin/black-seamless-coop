@@ -3,6 +3,7 @@
 //   state                         key=value: frame, level, unit, play, page, feet, eye, fwd, yaw, pitch, hp, coop
 //   npcs                          the live characters, one a line
 //   triggers [all]                the armed (or all) type 11 triggers: id, mode, action, where
+//   props [n]                     the n (12) nearest props of the loaded units: id, kind, state, health, where
 //   stand <list.index|id> [n]     the body in that trigger's centre as the triggers are tested, n frames (12)
 //   page                          the menu page's name
 //   pad <a,b,x,y,black,white,lt,rt,up,down,left,right,start,back,ls,rs> [ms]   press for ms (150)
@@ -12,6 +13,7 @@
 //   yaw <deg> / pitch <deg>       the view's angles, absolute; turn <deg>: relative yaw
 //   aim <x> <y> <z> / aim nearest the view on a point (a living enemy's chest, followed), until aim off
 //   teleport <x> <y> <z> / teleport partner   the body there, or a step behind the partner
+//   rocket [speed]                an RPG round of the player's from the eye along the view (0x1E35F0, side 3)
 //   log <text>                    a line in this copy's log
 //   peek / peekf <addr> [n]       n dwords, hex or floats; addr hex, or @player+hex, @world+hex
 //   pokef <addr> <f>...           floats written there
@@ -30,6 +32,7 @@
 #include "game/coop.h"
 #include "game/coop_control.h"
 #include "game/coop_net.h"
+#include "game/coop_npcs.h"
 #include "game/coop_shots.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
@@ -70,11 +73,12 @@ constexpr uint32_t kTriggerVtable = 0x28EF88;  // type 11
 constexpr float kPi = 3.14159265f;
 
 bool g_enabled = false;
+X86Context* g_ctx = nullptr;  // the game thread's, while Poll runs the commands
 
 // stand: the player put in a trigger's centre for some frames, after its own update and before the triggers are
 // tested (and before this copy's state goes to the partner), the trigger's box holding the body as it is tested
 struct Stand {
-    uint32_t trigger = 0;
+    uint32_t id_lo = 0, id_hi = 0;  // the trigger, found again each frame: a unit unloaded takes it away
     int frames = 0;
 } g_stand;
 
@@ -189,9 +193,15 @@ std::string State() {
     }
     const shots::Counters& sc = shots::Count();
     const world::Counters& wc = world::Count();
-    std::snprintf(buf, sizeof buf, " shots=%u/%u/%u/%u world=%u/%u/%u/%u/%u/%u/%u coop=\"%s\"", sc.sent, sc.taken,
-                  sc.fired, sc.dropped, wc.sent, wc.taken, wc.applied, wc.waiting, wc.lost, wc.stale, wc.triggers,
-                  coop::Status());
+    uint32_t slot, sound, sstate;
+    shots::Gunshot(slot, sound, sstate);
+    const npcs::Counters& nc = npcs::Count();
+    std::snprintf(buf, sizeof buf,
+                  " shots=%u/%u/%u/%u flash=%u gunshot=%u heard=%u slot=%08X sound=%08X sstate=%u world=%u/%u/%u/%u/%u/%u/%u"
+                  " props=%u proj=%u npcs=%u/%u/%u/%u/%u body=%08X/%u seen=%u targeted=%u coop=\"%s\"",
+                  sc.sent, sc.taken, sc.fired, sc.dropped, sc.flashes, sc.gunshots, sc.heard, slot, sound, sstate, wc.sent, wc.taken,
+                  wc.applied, wc.waiting, wc.lost, wc.stale, wc.triggers, wc.props, wc.projectiles, nc.snapshots, nc.made,
+                  nc.let_go, nc.driven, nc.refused, npcs::Body(), nc.bodies, nc.seen, nc.targeted, coop::Status());
     s += buf;
     return s;
 }
@@ -278,6 +288,44 @@ std::string Triggers(bool all) {
         }
     }
     return s.empty() ? "none" : s;
+}
+
+// the loaded units' kind 3 and kind 4 props nearest the eye: id, kind, state, health, where (their matrix row +0xA0)
+std::string Props(int max) {
+    uint32_t world = R32(kWorld);
+    if (!world) return "none";
+    const float* eye = &G<float>(Player() + kPlayerEye);
+    struct Row {
+        float d;
+        std::string text;
+    };
+    std::vector<Row> rows;
+    char buf[160];
+    for (uint32_t slot = 0; slot < 2; slot++) {
+        uint32_t s = world + 0x49D0 + slot * 0x880;
+        for (uint32_t kind = 3; kind <= 4; kind++) {
+            uint32_t array = R32(s + (kind == 3 ? 0x18 : 0x1C));
+            uint32_t n = R32(s + (kind == 3 ? 0x30 : 0x34));
+            uint32_t stride = kind == 3 ? 0x1D0 : 0x200;
+            if (!array || n > 4096) continue;
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t p = array + i * stride;
+                const float* pos = &G<float>(p + 0xA0);
+                float d[3] = {pos[0] - eye[0], pos[1] - eye[1], pos[2] - eye[2]};
+                float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                int state = kind == 3 ? int(int32_t(R32(p + 0x1A4))) : int(int32_t(R32(R32(p + 0x1A0) + 4)));
+                float hp = kind == 3 ? G<float>(p + 0x1A0) : G<float>(R32(p + 0x1A0));
+                std::snprintf(buf, sizeof buf, "%08X%08X k%u u%u state=%d hp=%.0f at=%.1f,%.1f,%.1f d=%.1f\n", R32(p + 0x0C),
+                              R32(p + 0x08), kind, slot, state, double(hp), double(pos[0]), double(pos[1]),
+                              double(pos[2]), double(dist));
+                rows.push_back({dist, buf});
+            }
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.d < b.d; });
+    std::string out;
+    for (int i = 0; i < int(rows.size()) && i < max; i++) out += rows[size_t(i)].text;
+    return out.empty() ? "none" : out;
 }
 
 // a type 11 trigger by "list.index" or by its id in hex
@@ -373,12 +421,13 @@ std::string Run(const std::string& line) {
     if (c == "state") return State();
     if (c == "npcs") return Npcs();
     if (c == "triggers") return Triggers(a.size() > 1 && a[1] == "all");
+    if (c == "props") return Props(std::clamp(a.size() > 1 ? std::atoi(a[1].c_str()) : 12, 1, 60));
     if (c == "stand") {
         // stand <list.index | id hex> [frames]
         if (a.size() < 2) return "error stand <list.index|id> [frames]";
         uint32_t t = FindTrigger(a[1]);
         if (!t) return "error no such trigger";
-        g_stand = {t, std::clamp(a.size() > 2 ? std::atoi(a[2].c_str()) : 12, 1, 600)};
+        g_stand = {R32(t + 0x08), R32(t + 0x0C), std::clamp(a.size() > 2 ? std::atoi(a[2].c_str()) : 12, 1, 600)};
         char buf[64];
         std::snprintf(buf, sizeof buf, "standing in %08X%08X", R32(t + 0x0C), R32(t + 0x08));
         LOGR("ctl: %s", buf);
@@ -449,6 +498,30 @@ std::string Run(const std::string& line) {
         else G<float>(ctl + kControllerYaw) += v;
         return "ok";
     }
+    if (c == "rocket") {
+        // the player's RPG round from the eye along the view, as the RPG's fire does (0x1E878F): the game's own rocket
+        if (!world) return "error no world";
+        uint32_t armoury = R32(0x2D12D0), table = armoury ? R32(armoury) : 0;
+        uint32_t entry = table ? R32(table + 4) + 6 * 32 : 0;  // type 6, BG1_RPG
+        uint32_t fx = entry ? R32(entry + 0x10) : 0;
+        if (!fx || !R32(0x2D1998)) return "error no rocket here";
+        float speed = a.size() > 1 ? float(std::atof(a[1].c_str())) : 40.0f;
+        static uint32_t matrix = 0, vel = 0;
+        if (!matrix) matrix = mem::AllocSystem(64, 16), vel = mem::AllocSystem(16, 16);
+        uint32_t p = Player();
+        float m[16];
+        std::memcpy(m, HostPtr(p + 0xD0), 64);  // right, up, forward, the eye
+        for (int i = 0; i < 3; i++) m[12 + i] += m[8 + i] * 1.0f;
+        m[15] = 1;
+        float v[4] = {m[8] * speed, m[9] * speed, m[10] * speed, 0};
+        std::memcpy(HostPtr(matrix), m, 64);
+        std::memcpy(HostPtr(vel), v, 16);
+        static constexpr hle::Map kRocket =
+            hle::Make({hle::ecx, hle::edi, hle::stack, hle::stack, hle::stack, hle::stack});
+        hle::Call(*g_ctx, 0x1E35F0, kRocket, {R32(0x2D1998), 3, matrix, vel, R32(fx + 0x08), R32(fx + 0x0C)});
+        LOGR("ctl: rocket fired");
+        return "rocket fired";
+    }
     if (c == "teleport") {
         if (!world) return "error no world";
         float to[3];
@@ -506,8 +579,9 @@ void Init(uint16_t port) {
 
 bool Enabled() { return g_enabled; }
 
-void Poll(X86Context&) {
+void Poll(X86Context& ctx) {
     if (!g_enabled) return;
+    g_ctx = &ctx;
     char in[512];
     net::Peer from;
     for (int i = 0, n; i < 16 && (n = net::ReceiveControl(from, in, sizeof in - 1)) >= 0; i++) {
@@ -524,10 +598,22 @@ void Poll(X86Context&) {
 void BeforeTriggers() {
     if (!g_enabled || g_stand.frames <= 0 || !R32(kWorld)) return;
     g_stand.frames--;
+    char id[20];
+    std::snprintf(id, sizeof id, "%08X%08X", g_stand.id_hi, g_stand.id_lo);
+    uint32_t t = FindTrigger(id);
+    if (!t) {
+        g_stand.frames = 0;
+        return;
+    }
     float at[3];
-    TriggerCentre(g_stand.trigger, at);
+    TriggerCentre(t, at);
     at[1] -= G<float>(R32(kWorld) + kWorldHeight) * 0.5f;  // the test lifts the body by half its height
     Teleport(at);
+}
+
+void LevelReset() {
+    g_stand = {};
+    g_aim.on = false;
 }
 
 bool Override(int port, input::Pad& pad) {

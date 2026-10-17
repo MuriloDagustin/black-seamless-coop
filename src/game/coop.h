@@ -18,8 +18,13 @@ void EndFrame();       // this copy's player, to the partner
 void MarkSimulated();  // the player update runs this frame (PhysicsTime 0x1F11CD)
 void LatchCamera();    // the scene camera's view and projection are the device's (AmbientOcclusion 0x1EE9A5)
 bool PartnerFeet(float out[3]);  // the partner's body in this level, in play and heard from of late
+bool PartnerInLevel();           // heard from of late, its last level this one: in play or paused in it
+bool HostHeard();                // a joining copy: its host welcomed it and was heard from of late
 bool InPlay();                   // the world steps and its player with it
 const float* PartnerForward();   // the partner's view, its last state's forward row
+// the partner's walk in this level as received, the points after the count 'after' (moved on); gap: some were lost
+int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap);
+uint64_t PartnerPathEnd();
 
 // x and y in lines of a 480 frame from the output's top left, as the overlay's DrawText takes them
 struct Marker {
