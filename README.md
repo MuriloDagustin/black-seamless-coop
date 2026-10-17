@@ -25,6 +25,8 @@ versions this mod was made with, and puts the mod on top. You need your own copy
 | Props, grenades, rockets | crates, barrels and breakable scenery break on both copies; the partner's grenades and rockets fly and explode on yours |
 | Triggers | one-shot area triggers (enemy waves, scripted scenes) fire for either player's position |
 | Level flow | the game moves on to the next area only when both players have gone through; the one ahead waits at the next door (a LOADING screen) until the other comes. Mission failed and level complete count for both |
+| F10 CO-OP tab | host a server, see servers on the LAN, join by IP or host name, or leave, without restarting the game. The role, port and address are saved in `black.toml` |
+| Secondary objectives | blackmail, intel, recon and armament pickups count on both copies (each by its own script action, so two pickups at once do not count twice), and the picked item goes from the partner's map too |
 | Get me out of here | **F8**, or **L3 + R3** held for a second on a controller: you are put next to your partner, on the way it just walked |
 | Test channel | `--coop-control`: a local text channel that drives a copy without its window's focus (pad, aim, teleport, state), for automated two-copy tests |
 
@@ -52,6 +54,12 @@ setup.bat [folder] [Black.iso]
 Both players need this same build.
 
 ## Playing
+
+The easiest way: **F10 → CO-OP**. One player hosts; the other picks the host from the list (LAN) or types its
+address. Connect before loading the mission, then load the same mission on both copies. Over the internet, the
+host must be reachable on UDP 45410 (a port forward on its router, or a virtual LAN such as Tailscale).
+
+From the command line:
 
 ```
 BLACK.exe --coop host                      the host, UDP 45410
