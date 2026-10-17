@@ -12,6 +12,8 @@ struct Peer {
 inline bool operator==(const Peer& a, const Peer& b) { return a.addr == b.addr && a.port == b.port; }
 
 bool Open(uint16_t port);                  // 0: any free port
+void Close();
+std::string HostName();
 uint32_t Resolve(const std::string& host);  // an IPv4 or a name; 0 when not found
 bool Send(const Peer& to, const void* p, int n);
 int Receive(Peer& from, void* p, int n);  // -1 nothing waiting, 0 a datagram lost, else its bytes

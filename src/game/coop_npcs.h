@@ -10,6 +10,7 @@
 #include "kernel/kernel.h"
 
 namespace coop::npcs {
+void Stop(X86Context& ctx);
 
 void SetMode(bool host, bool puppets, bool body);  // the host sends, the joining copy plays puppets; the partner's body
 

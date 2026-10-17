@@ -19,24 +19,30 @@ namespace coop::net {
 namespace {
 
 SOCKET g_socket = INVALID_SOCKET;
+bool g_started = false;
 constexpr DWORD kUdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET: a port unreachable must not fail the next recv
 
 }  // namespace
 
 bool Open(uint16_t port) {
+    Close();
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
         LOGE("coop: WSAStartup failed");
         return false;
     }
+    g_started = true;
     g_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_socket == INVALID_SOCKET) {
         LOGE("coop: socket failed (%d)", WSAGetLastError());
+        Close();
         return false;
     }
     u_long on = 1;
     ::ioctlsocket(g_socket, FIONBIO, &on);
     BOOL off = FALSE;
+    BOOL broadcast = TRUE;
+    setsockopt(g_socket, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&broadcast), sizeof broadcast);
     DWORD bytes = 0;
     WSAIoctl(g_socket, kUdpConnReset, &off, sizeof off, nullptr, 0, &bytes, nullptr, nullptr);
     sockaddr_in a{};
@@ -45,11 +51,22 @@ bool Open(uint16_t port) {
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     if (::bind(g_socket, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0) {
         LOGE("coop: bind of UDP %u failed (%d)", port, WSAGetLastError());
-        ::closesocket(g_socket);
-        g_socket = INVALID_SOCKET;
+        Close();
         return false;
     }
     return true;
+}
+
+void Close() {
+    if (g_socket != INVALID_SOCKET) ::closesocket(g_socket);
+    g_socket = INVALID_SOCKET;
+    if (g_started) WSACleanup();
+    g_started = false;
+}
+
+std::string HostName() {
+    char name[64]{};
+    return gethostname(name, sizeof name - 1) == 0 ? name : "BLACK host";
 }
 
 uint32_t Resolve(const std::string& host) {

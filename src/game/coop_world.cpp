@@ -125,7 +125,7 @@ constexpr uint32_t kRetryFrames = 120;
 constexpr size_t kWaitingMax = 256;
 constexpr int kProbeLines = 1500;
 
-enum Type : uint8_t { kDeath = 1, kProp, kProjectile, kMelee, kFlow };
+enum Type : uint8_t { kDeath = 1, kProp, kProjectile, kMelee, kFlow, kObjective };
 
 #pragma pack(push, 1)
 // A death names the spawner and carries the killing hit. A prop's state (kProp) puts the prop's id in name, its
@@ -222,6 +222,36 @@ struct PropSent {
     uint32_t frame;
 };
 std::unordered_map<PropKey, PropSent, PropKeyHash> g_props_sent;
+
+// Secondary progress is a set of script action IDs, not a maximum of the two
+// players' category totals: each player may collect a different blackmail item.
+// These survive a peer reconnect and are cleared only when this level reloads.
+std::unordered_set<uint64_t> g_objectives_seen;
+std::unordered_set<uint64_t> g_collected_pickups;
+uint64_t g_objective_pickup = 0;  // the pickup whose removal is firing its scripts
+
+uint32_t Objective(uint64_t name) {
+    uint32_t world = R32(kWorld);
+    if (!world) return 0;
+    uint32_t array = R32(world + 0x930), count = std::min(R32(world + 0x934), 4096u);
+    for (uint32_t i = 0; array && i < count; i++) {
+        uint32_t row = array + i * 12, def = R32(row);
+        if (def && (uint64_t(R32(def)) | uint64_t(R32(def + 4)) << 32) == name) return row;
+    }
+    return 0;
+}
+
+void HideCollectedPickups(X86Context& ctx) {
+    uint32_t mgr = R32(0x2D0D64);
+    if (!mgr || g_collected_pickups.empty()) return;
+    static constexpr hle::Map kRemove = hle::Make({hle::ecx, hle::esi, hle::stack});
+    for (uint32_t i = 0; i < 64; i++) {
+        uint32_t p = mgr + i * 0x160;
+        uint64_t id = uint64_t(R32(p + 8)) | uint64_t(R32(p + 12)) << 32;
+        if (id && g_collected_pickups.count(id) && G<uint8_t>(p + 0x13B) && !G<uint8_t>(p + 0x154))
+            hle::Call(ctx, 0x1BED90, kRemove, {mgr, p, 0});
+    }
+}
 
 // a unit advance of this copy's player's waiting for the partner to go through the same trigger
 struct Advance {
@@ -446,6 +476,60 @@ void SendFlow(uint8_t kind, uint32_t a1, uint32_t a2) {
                                              : kind == 4 ? "level end"
                                              : kind == kFlowContinue ? "continue the mission"
                                                                      : "restart the mission");
+}
+
+// kObjective: name is the unique action; dir[0..2] carry the objective's two
+// words and message hash as raw bits, dir[3]/dmg the collectible's two words.
+Result ApplyObjective(X86Context& ctx, const Event& e) {
+    if (e.ordinal != 0xFFFF && uint8_t(e.ordinal) != g_load) return Result::Stale;
+    uint32_t row = Objective(Name(std::bit_cast<uint32_t>(e.dir[0]), std::bit_cast<uint32_t>(e.dir[1])));
+    if (!row) return Result::Wait;
+    uint32_t def = R32(row);
+    if (!(G<uint8_t>(def + 0x15) & 0x3C)) return Result::Stale;
+    // Apply before the game's complete request is processed, including when a
+    // packet arrived on the frame that the local end trigger fired.
+    uint64_t id = Name(e.name_lo, e.name_hi);
+    if (g_objectives_seen.insert(id).second && R32(row + 8) != 3) {
+        if (!R32(row + 8)) W32(row + 8, 1);  // its local activation may be a frame behind
+        static constexpr hle::Map kProgress = hle::Make({hle::esi, hle::eax});
+        g_applying = true;
+        hle::Call(ctx, 0x1BA430, kProgress, {row, std::bit_cast<uint32_t>(e.dir[2])});
+        g_applying = false;
+        g_count.applied++;
+        LOGR("coop: secondary objective action %016llX collected here too", (unsigned long long)id);
+    }
+    uint64_t pickup = Name(std::bit_cast<uint32_t>(e.dir[3]), std::bit_cast<uint32_t>(e.dmg));
+    if (pickup) g_collected_pickups.insert(pickup);
+    return Result::Done;
+}
+
+// Called before the original script action, so its event precedes any mission
+// complete event it may cause. Returning true suppresses an action already seen.
+bool ObjectiveAction(uint32_t action) {
+    if (!g_net || g_stage < 6 || !action) return false;
+    uint32_t data = R32(action + 0x20);
+    if (!data || G<uint8_t>(data + 0x0C) != 1) return false;
+    uint32_t row = Objective(Name(R32(data), R32(data + 4)));
+    if (!row || !(G<uint8_t>(R32(row) + 0x15) & 0x3C)) return false;
+    uint64_t id = Name(R32(action + 8), R32(action + 12));
+    if (!id) return false;
+    if (g_objectives_seen.count(id)) return true;
+    uint32_t game = R32(kGame), state = R32(row + 8);
+    if (!game || R32(game + kGameState) != game + kInLevel || (state != 1 && state != 2)) return false;
+    g_objectives_seen.insert(id);
+    Event e{};
+    e.type = kObjective;
+    e.name_lo = uint32_t(id), e.name_hi = uint32_t(id >> 32);
+    e.ordinal = g_partner_load < 0 ? 0xFFFF : uint16_t(uint8_t(g_partner_load));
+    e.dir[0] = std::bit_cast<float>(R32(data));
+    e.dir[1] = std::bit_cast<float>(R32(data + 4));
+    e.dir[2] = std::bit_cast<float>(R32(data + 8));
+    e.dir[3] = std::bit_cast<float>(uint32_t(g_objective_pickup));
+    e.dmg = std::bit_cast<float>(uint32_t(g_objective_pickup >> 32));
+    Post(e);
+    LOGR("coop: secondary objective action %016llX sent, pickup %016llX", (unsigned long long)id,
+         (unsigned long long)g_objective_pickup);
+    return false;
 }
 
 // the joining player's melee on the host's enemy: its hit there, by the joining player's body
@@ -717,7 +801,7 @@ void Incoming(const uint8_t* p, int bytes, int count, uint64_t now) {
         PartnerLoad(e.load, e.level);
         bool reloaded = e.level == g_partner_level && e.load != uint8_t(g_partner_load);
         bool wanted = (e.type == kDeath && g_stage >= 1) || ((e.type == kProp || e.type == kProjectile) && g_stage >= 3) ||
-                      (e.type == kMelee && g_stage >= 4) || (e.type == kFlow && g_stage >= 6);
+                      (e.type == kMelee && g_stage >= 4) || ((e.type == kFlow || e.type == kObjective) && g_stage >= 6);
         if (!wanted || reloaded) {
             g_count.lost++;  // from before the partner loaded that level again
             continue;
@@ -777,14 +861,18 @@ void Tick(X86Context& ctx) {
         g_props_retry = false;
         std::erase_if(g_props, [&](const Event& e) { return e.level == level && ApplyProp(ctx, e) == PropResult::Done; });
     }
-    if (g_waiting.empty()) return;
+    if (g_waiting.empty()) {
+        HideCollectedPickups(ctx);
+        return;
+    }
     for (size_t i = 0; i < g_waiting.size();) {
         Waiting& w = g_waiting[i];
         if (w.e.level != level) {  // the partner's level, not ours yet: it waits
             i++;
             continue;
         }
-        Result r = w.e.type == kMelee  ? ApplyMelee(ctx, w.e)
+        Result r = w.e.type == kObjective ? ApplyObjective(ctx, w.e)
+                   : w.e.type == kMelee  ? ApplyMelee(ctx, w.e)
                    : w.e.type == kFlow ? ApplyFlow(ctx, w.e)
                                        : Apply(ctx, w.e);
         if (r == Result::Done || r == Result::Stale || (r == Result::Later && ++w.frames > kRetryFrames)) {
@@ -796,10 +884,14 @@ void Tick(X86Context& ctx) {
         i++;
     }
     g_count.waiting = uint32_t(g_waiting.size());
+    HideCollectedPickups(ctx);
 }
 
 // From the loader's bullet reset (0x1EDE4C), the new level already in world+0x5AEC (0x1EDD64)
 void LevelReset() {
+    g_objectives_seen.clear();
+    g_collected_pickups.clear();
+    g_objective_pickup = 0;
     for (Npc& n : g_npcs) n = {};
     g_spawns.clear();
     g_own.clear();
@@ -992,6 +1084,16 @@ void AskRescue() {
     g_rescue_on = true;
     g_rescue_at = NowMs();
     g_rescue_behind = 0;
+}
+
+void Stop(X86Context& ctx) {
+    Resume(ctx);
+    g_advance = {};
+    g_rescue_on = false;
+    g_advancing = false;
+    g_partner_test = false;
+    Reset();
+    SetMode(false, 0);
 }
 
 // Each frame, the world stopped or not: the advance waiting for the partner goes once the partner has gone through
@@ -1209,6 +1311,31 @@ void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
 }  // namespace coop::world
 
 using namespace coop::world;
+
+// A script's objective action, thiscall; one actor argument, ret 4.
+X86_EXTERN_FUNC(__imp__sub_001C2290);
+X86_FUNC(sub_001C2290) {
+    if (ObjectiveAction(ctx.ecx)) {
+        ctx.esp += 8;
+        return;
+    }
+    __imp__sub_001C2290(ctx, base);
+}
+
+// A collected pickup fires its linked scripts on its update, after removal.
+// Remember its stable map ID while those actions run so the peer can remove it
+// as well; ammunition and health without an objective stay local.
+X86_EXTERN_FUNC(__imp__sub_001E4580);
+X86_FUNC(sub_001E4580) {
+    uint64_t previous = g_objective_pickup;
+    uint32_t p = ctx.ecx;
+    // Its base update performs collision tests and may mark it collected during
+    // this very call, so capture the ID even before +0x154 has been set.
+    if (G<uint8_t>(p + 0x13B))
+        g_objective_pickup = Name(R32(p + 8), R32(p + 12));
+    __imp__sub_001E4580(ctx, base);
+    g_objective_pickup = previous;
+}
 
 // The one place AI characters are made (its one call 0x1AF967): eax the pool; the controller, the descriptor;
 // ret 8, eax the character or 0

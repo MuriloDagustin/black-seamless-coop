@@ -2,6 +2,8 @@
 // Co-op, phase 1 (the ghost): each copy sends its player's view over UDP and the other marks where the partner is.
 // Everything here but Init runs on the game thread, inside one call of the frame function 0x20F6A0.
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "kernel/kernel.h"
 
@@ -9,10 +11,28 @@ namespace coop {
 
 enum class Role : uint32_t { Off = 0, Host = 1, Join = 2 };
 
+struct Server {
+    std::string address, name;
+    uint16_t port = 45410;
+    bool busy = false;
+    uint32_t session = 0;
+};
+struct Session {
+    Role role = Role::Off;
+    bool running = false, pending = false, searching = false;
+    uint16_t port = 45410;
+    std::string status = "COOP OFF", error;
+    std::vector<Server> servers;
+};
+Session GetSession();  // thread-safe copy for F10
+void RequestStart(Role role, const std::string& host, uint16_t port);
+void RequestStop();
+void RequestSearch(uint16_t port);
+
 void Init();           // the settings and the command line, the socket; before boot
 bool Active();         // anything to run or draw: a partner, the echo or the probe
 bool Networked();      // a role and an open socket: the partner waits on this copy's packets
-void BeginFrame();     // the partner's packets
+void BeginFrame(X86Context& ctx);  // queued UI commands and the partner's packets
 void Control(X86Context& ctx);  // the test control channel's commands (coop_control.cpp)
 void EndFrame();       // this copy's player, to the partner
 void MarkSimulated();  // the player update runs this frame (PhysicsTime 0x1F11CD)

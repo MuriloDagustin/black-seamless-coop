@@ -423,7 +423,65 @@ std::string Run(const std::string& line) {
     uint64_t now = NowMs();
     if (c == "ping") return "pong frame=" + std::to_string(R32(kFrameCount));
     if (c == "state") return State();
+    if (c == "coop") {
+        if (a.size() > 1 && a[1] == "stop") coop::RequestStop();
+        else if (a.size() > 1 && a[1] == "search")
+            coop::RequestSearch(uint16_t(std::clamp(a.size() > 2 ? std::atoi(a[2].c_str()) : 45410, 1, 65535)));
+        else if (a.size() > 1 && (a[1] == "host" || a[1] == "join")) {
+            if (a[1] == "join" && a.size() < 3) return "error coop join <host> [port]";
+            int port_arg = a[1] == "host" ? 2 : 3;
+            int port = a.size() > size_t(port_arg) ? std::atoi(a[size_t(port_arg)].c_str()) : 45410;
+            if (port < 1 || port > 65535) return "error invalid port";
+            coop::RequestStart(a[1] == "host" ? coop::Role::Host : coop::Role::Join,
+                               a[1] == "join" ? a[2] : "", uint16_t(port));
+        } else if (a.size() > 1) return "error coop [host <port>|join <host> <port>|search <port>|stop]";
+        coop::Session session = coop::GetSession();
+        std::string result = session.status + " running=" + std::to_string(session.running) +
+                             " pending=" + std::to_string(session.pending) + " error=" + session.error;
+        for (const auto& server : session.servers)
+            result += "\n" + server.address + ":" + std::to_string(server.port) + " " + server.name +
+                      (server.busy ? " full" : " available");
+        return result;
+    }
     if (c == "npcs") return Npcs();
+    if (c == "objectives" || c == "objective") {
+        uint32_t world = R32(kWorld), mgr = R32(kLogic);
+        if (!world || !mgr) return "error no world";
+        uint32_t rows = R32(world + 0x930), count = std::min(R32(world + 0x934), 4096u);
+        std::string result;
+        char row[192];
+        for (uint32_t list = 0; list < 32; list++) {
+            uint32_t array = R32(mgr + 0x48 + list * 4);
+            // The actor/action arrays 16/17 and 22/23 exchange count slots.
+            uint32_t index = list == 16 || list == 17 ? list + 6 : list == 22 || list == 23 ? list - 6 : list;
+            uint32_t n = std::min(uint32_t(G<uint16_t>(mgr + index * 2)), 4096u);
+            for (uint32_t i = 0; array && i < n; i++) {
+                uint32_t action = R32(array + i * 4);
+                if (!action || R32(action) != 0x28EB2C) continue;
+                uint32_t data = R32(action + 0x20);
+                if (!data || G<uint8_t>(data + 12) != 1) continue;
+                for (uint32_t j = 0; rows && j < count; j++) {
+                    uint32_t objective = rows + j * 12, def = R32(objective);
+                    if (!def || R32(def) != R32(data) || R32(def + 4) != R32(data + 4)) continue;
+                    uint8_t flags = G<uint8_t>(def + 0x15);
+                    if (!(flags & 0x3C)) continue;
+                    char id[20];
+                    std::snprintf(id, sizeof id, "%08X%08X", R32(action + 12), R32(action + 8));
+                    if (c == "objective" && a.size() == 2 && _stricmp(id, a[1].c_str()) == 0) {
+                        static constexpr hle::Map kAction = hle::Make({hle::ecx, hle::stack});
+                        hle::Call(*g_ctx, 0x1C2290, kAction, {action, Player()});
+                        return "asked " + std::string(id);
+                    }
+                    std::snprintf(row, sizeof row, "%s flags=%u progress=%u state=%u target=%u\n", id, flags,
+                                  R32(objective + 8) == 3 ? G<uint8_t>(def + 0x14) : R32(objective + 4) - 1,
+                                  R32(objective + 8), G<uint8_t>(def + 0x14));
+                    result += row;
+                }
+            }
+        }
+        if (c == "objective") return "error objective <secondary action id from objectives>";
+        return result.empty() ? "none" : result;
+    }
     if (c == "triggers") return Triggers(a.size() > 1 && (a[1] == "all" || a[1] == "units"), a.size() > 1 && a[1] == "units");
     if (c == "props") return Props(std::clamp(a.size() > 1 ? std::atoi(a[1].c_str()) : 12, 1, 60));
     if (c == "stand") {
