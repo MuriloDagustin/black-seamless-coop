@@ -48,6 +48,8 @@ constexpr uint32_t kPlayerFeet = 0xA0;  // the body's position, the last row of 
 constexpr uint32_t kRowEye = 3;
 constexpr uint32_t kRowForward = 2;
 constexpr uint32_t kPlayerCrouch = 0x3A1;
+constexpr uint32_t kWorldUnit = 0x5AF0;
+constexpr uint32_t kUnitSlots = 0x49D0, kUnitSlotSize = 0x880;  // +8 the unit held, +0x38 activated
 constexpr uint32_t kWorldLastPos = 0x1C0;  // the player's position a frame ago (the triggers' sweep)
 constexpr uint32_t kTransformView = 0;  // XDK transform types
 constexpr uint32_t kTransformProjection = 1;
@@ -61,7 +63,7 @@ constexpr float kSmoothMs = 80;
 constexpr float kSnap = 5;  // world units: farther in a step is a jump, not a move
 
 constexpr uint32_t kMagic = 0x4F434B42;  // "BKCO"
-constexpr uint16_t kProtocol = 11;
+constexpr uint16_t kProtocol = 12;
 enum Type : uint8_t { kHello = 1, kWelcome, kState, kBye, kShots, kWorldEvents, kNpcSnap };
 
 #pragma pack(push, 1)
@@ -83,6 +85,9 @@ struct State {
     uint8_t load;        // the sender's level loads (world::Load)
     int8_t load_level;   // and the level of its last
     uint8_t crouch;      // its player crouches (player+0x3A1, from its controller +0x40 at 0x1F09C1)
+    uint8_t unit;         // its current unit (world+0x5AF0), in or out of play
+    uint8_t next_active;  // and the next one activated there
+    uint8_t waiting;      // the unit its advance waits for this copy to reach (world::WaitingUnit), 0 none
     float view[4][3];  // right, up, forward, eye
     float feet[3];     // the body, player+0xA0: where the triggers test the player
     float yaw, pitch;
@@ -133,6 +138,7 @@ State g_local{};
 struct PathPoint {
     float feet[3];
     int8_t level;
+    uint8_t reach;  // the farthest unit the partner could stand in then: its current one or the one it waits for
 };
 constexpr uint64_t kPathSize = 256;
 PathPoint g_path[kPathSize];
@@ -183,6 +189,16 @@ void Sample(State& s, uint64_t now) {
     s.load_level = world::LoadLevel();
     uint32_t world = R32(kWorld);
     s.in_level = world && Live();
+    if (world) {
+        s.unit = uint8_t(R32(world + kWorldUnit));
+        for (uint32_t k = 0; k < 2; k++) {
+            uint32_t slot = world + kUnitSlots + k * kUnitSlotSize;
+            if (R32(slot + 8) == s.unit + 1u && G<uint8_t>(slot + 0x38)) s.next_active = 1;
+        }
+        s.waiting = world::WaitingUnit();
+        uint32_t stream = R32(world + 0x5AE8);  // an advance under way (1, then 3 at 0x1F1143): its unit is the next one
+        if (stream == 1 || stream == 3) s.waiting = std::max<uint8_t>(s.waiting, uint8_t(s.unit + 1));
+    }
     if (!s.in_level) return;
     uint32_t player = world + kWorldPlayer;
     s.level = G<int8_t>(world + kWorldLevel);
@@ -240,6 +256,7 @@ void Receive(uint64_t now) {
                         PathPoint& pp = g_path[g_path_count % kPathSize];
                         std::memcpy(pp.feet, in.state.feet, sizeof pp.feet);
                         pp.level = in.state.level;
+                        pp.reach = std::max(in.state.unit, in.state.waiting);
                         g_path_count++;
                     }
                     shots::Acked(in.state.shot_ack);
@@ -408,6 +425,12 @@ bool PartnerAt(float out[3]) {
     std::memcpy(out, g_remote.feet, 12);
     return true;
 }
+int PartnerUnit(int* next_active, int* waiting) {
+    if (!PartnerInLevel()) return -1;
+    if (next_active) *next_active = g_remote.next_active;
+    if (waiting) *waiting = g_remote.waiting;
+    return g_remote.unit;
+}
 bool HostHeard() { return g_net && g_cfg.role == Role::Join && g_welcomed && NowMs() - g_last_rx <= kTimeoutMs; }
 bool Networked() { return g_net; }
 
@@ -436,13 +459,14 @@ uint32_t Rescues() { return g_rescues; }
 
 namespace {
 
-// a place the partner stood a moment ago, a step or more from it: walked on, not in a wall
-bool TrailPoint(const float partner[3], int8_t level, float out[3]) {
+// a place the partner stood a moment ago, a step or more from it: walked on, not in a wall, in a unit this copy has
+// (the partner's reach then at least the unit)
+bool TrailPoint(const float partner[3], int8_t level, uint8_t unit, float out[3]) {
     constexpr float kNear = 1.2f, kFar = 6.0f;
     uint64_t first = g_path_count > kPathSize ? g_path_count - kPathSize : 0;
     for (uint64_t k = g_path_count; k-- > first;) {
         const PathPoint& p = g_path[k % kPathSize];
-        if (p.level != level) break;
+        if (p.level != level || p.reach < unit) break;
         float d[3] = {p.feet[0] - partner[0], p.feet[1] - partner[1], p.feet[2] - partner[2]};
         float dist = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
         if (dist > kFar) break;
@@ -454,9 +478,12 @@ bool TrailPoint(const float partner[3], int8_t level, float out[3]) {
     return false;
 }
 
-void Rescue(X86Context& ctx) {
+}  // namespace
+
+// this copy's player put next to the partner: the world's units are the partner's already (world::FlowTick)
+bool PlaceByPartner(uint8_t unit) {
     uint32_t world = R32(kWorld);
-    if (!world || !Live()) return;
+    if (!world) return false;
     int8_t level = G<int8_t>(world + kWorldLevel);
     float partner[3];
     bool at = PartnerAt(partner);
@@ -466,17 +493,16 @@ void Rescue(X86Context& ctx) {
     }
     if (!at) {
         LOGR("coop: get me out of here: the partner is not in this level");
-        return;
+        return false;
     }
     float to[3];
-    if (!TrailPoint(partner, level, to)) {
-        // standing still a while: a step behind it along its view, at its height
+    if (!TrailPoint(partner, level, unit, to)) {
+        // standing still a while: beside it, across its view (not back over a trigger it came through)
         const float* f = g_remote_play.view[kRowForward];
         float h = std::sqrt(f[0] * f[0] + f[2] * f[2]);
         std::memcpy(to, partner, 12);
-        if (h > 0.01f) to[0] -= f[0] / h * 1.5f, to[2] -= f[2] / h * 1.5f;
+        if (h > 0.01f) to[0] += f[2] / h * 0.8f, to[2] -= f[0] / h * 0.8f;
     }
-    world::RescueAdvance(ctx);  // past the advance the partner went through: this copy's too
     uint32_t player = world + kWorldPlayer;
     float* feet = &G<float>(player + kPlayerFeet);
     float* last = &G<float>(world + kWorldLastPos);
@@ -488,9 +514,8 @@ void Rescue(X86Context& ctx) {
     g_rescues++;
     LOGR("coop: get me out of here: put at %.1f %.1f %.1f, the partner at %.1f %.1f %.1f", double(to[0]), double(to[1]),
          double(to[2]), double(partner[0]), double(partner[1]), double(partner[2]));
+    return true;
 }
-
-}  // namespace
 
 void Init() {
     g_session = std::random_device{}() | 1;  // never 0, the value before any partner
@@ -651,7 +676,7 @@ X86_FUNC(sub_0020F6A0) {
     if (!coop::Active()) return __imp__sub_0020F6A0(ctx, base);
     coop::BeginFrame();
     coop::world::FlowTick(ctx);  // the world stopped or not
-    if (coop::g_rescue.exchange(false)) coop::Rescue(ctx);
+    if (coop::g_rescue.exchange(false)) coop::world::AskRescue();  // its steps in FlowTick
     coop::Control(ctx);  // test commands; the game object stays in eax, hle calls put registers back
     __imp__sub_0020F6A0(ctx, base);
     coop::EndFrame();

@@ -29,6 +29,9 @@ bool HostHeard();                // a joining copy: its host welcomed it and was
 bool InPlay();                   // the world steps and its player with it
 const float* PartnerForward();   // the partner's view, its last state's forward row
 bool PartnerCrouch();            // the partner crouches
+// the partner's current unit in this level (-1 not in it), its next one activated, the unit its advance waits for
+int PartnerUnit(int* next_active, int* waiting);
+bool PlaceByPartner(uint8_t unit);  // this copy's player put by the partner, on its way in that unit or past it
 // the partner's walk in this level as received, the points after the count 'after' (moved on); gap: some were lost
 int PartnerPath(uint64_t& after, float (*out)[3], int max, bool& gap);
 uint64_t PartnerPathEnd();
