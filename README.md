@@ -2,6 +2,8 @@
 
 🇧🇷 [Leia em português](README.pt-BR.md)
 
+![Three players together at the start of mission 6](docs/media/team-start-level6.jpg)
+
 Play the campaign of **Black** (Criterion, 2006) together with up to **8 players**, on PC.
 
 This is a mod for [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp), an unofficial native PC
@@ -28,6 +30,11 @@ The release plays over LAN or by IP. Online rooms by code (Epic Online Services)
 [Online rooms](#online-rooms) below.
 
 ## Playing together
+
+<p align="center">
+  <img src="docs/media/teammate-fighting-level4.gif" width="49%" alt="A teammate fighting an enemy in mission 4">
+  <img src="docs/media/teammate-close-level6.gif" width="49%" alt="A teammate up close in mission 6">
+</p>
 
 Press **F10 → CO-OP** in the game:
 
@@ -108,7 +115,8 @@ setup.bat black-recomp "C:\path	o\Black.iso"
 black-recompuild.bat
 ```
 
-The game is `black-recomp\outuildelease\BLACK.exe`. The first build recompiles the whole game and
+The game is `black-recomp\outuild
+elease\BLACK.exe`. The first build recompiles the whole game and
 takes a while.
 
 ### What the setup does

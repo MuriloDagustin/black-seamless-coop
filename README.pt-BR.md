@@ -2,6 +2,8 @@
 
 🇺🇸 [Read in English](README.md)
 
+![Três jogadores juntos no começo da missão 6](docs/media/team-start-level6.jpg)
+
 Jogue a campanha do **Black** (Criterion, 2006) junto com até **8 jogadores**, no PC.
 
 Este é um mod para a [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp), uma port nativa e não
@@ -38,9 +40,15 @@ setup.bat black-recomp "C:\caminho\para\Black.iso"
 black-recompuild.bat
 ```
 
-O jogo fica em `black-recomp\outuildelease\BLACK.exe`. A primeira compilação demora.
+O jogo fica em `black-recomp\outuild
+elease\BLACK.exe`. A primeira compilação demora.
 
 ## Jogando junto
+
+<p align="center">
+  <img src="docs/media/teammate-fighting-level4.gif" width="49%" alt="Um parceiro enfrentando um inimigo na missão 4">
+  <img src="docs/media/teammate-close-level6.gif" width="49%" alt="Um parceiro de perto na missão 6">
+</p>
 
 Aperte **F10 → CO-OP** no jogo:
 
