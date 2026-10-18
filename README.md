@@ -1,5 +1,7 @@
 # Black Seamless Co-op
 
+🇧🇷 [Leia em português](README.pt-BR.md)
+
 Play the campaign of **Black** (Criterion, 2006) together with up to **8 players**, on PC.
 
 This is a mod for [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp), an unofficial native PC
@@ -151,28 +153,6 @@ The port lets host code replace any recompiled function. The mod wraps, among ot
   the level flow;
 - the player's death (`0x1D54C0`, `0x1BD360`, `0x1C6410`) and the scene camera `0x2B830`: the lives and
   the spectator camera.
-
-## Português
-
-Co-op para até **8 jogadores** na campanha do **Black**, como mod da port para PC
-[BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp). **Você precisa da sua própria cópia do jogo**
-(Xbox, versão USA). Este repositório tem só o código do co-op.
-
-**Instalar:** instale git, Python 3 e o Visual Studio (com C++, Clang e CMake), rode
-`setup.bat black-recomp "C:\caminho\Black.iso"` e depois `black-recomp\build.bat`. O jogo fica em
-`black-recomp\out\build\release\BLACK.exe`. Todos precisam da mesma build: uma pessoa compila e passa a
-pasta `out\build\release` (sem o jogo) para os outros, e cada um coloca a própria cópia do jogo (a `.iso`
-ou os arquivos do disco) na pasta `assets` ao lado do `BLACK.exe`.
-
-**Jogar:** **F10 → CO-OP**. Um abre como host, os outros entram pela lista (mesma rede) ou pelo IP do host.
-Pela internet o host precisa liberar a porta **UDP 45410** (ou usar Tailscale/ZeroTier). Salas online por
-código funcionam via Epic Online Services, só numa build feita com a sua conta de desenvolvedor da Epic
-(veja [docs/online.md](docs/online.md)).
-
-**Regras:** quem morre fica caído assistindo um parceiro e volta quando o time chega na próxima área ou
-completa um objetivo; a missão só falha se todos caírem. **Shift** corre, **F8** te leva até um parceiro,
-e caído você troca quem assiste com clique, espaço ou as setas. Objetivos, continuar, reiniciar e o
-progresso salvo valem para todos.
 
 ## License
 
