@@ -16,22 +16,16 @@ is built on top of the game's own code, so expect rough edges (me and my friends
 
 ## Quick start
 
-1. **Install the tools** (once): Windows 10/11 64-bit, [git](https://git-scm.com/download/win),
-   [Python 3](https://www.python.org) and Visual Studio 2022 or later with *Desktop development with C++*,
-   *C++ Clang tools* and *C++ CMake tools*.
-2. **Download this repository** (green *Code* button → *Download ZIP*, or `git clone`).
-3. **Run the setup** with your disc image of Black:
-   ```
-   setup.bat black-recomp "C:\path\to\Black.iso"
-   ```
-   It downloads the port and the recompiler at the versions this mod was tested with, applies the mod and
-   extracts your game into `black-recomp\assets`.
-4. **Build**: run `black-recomp\build.bat`. The first build recompiles the whole game and takes a while.
-5. **Play**: `black-recomp\out\build\release\BLACK.exe`.
+1. **Download** the latest `BLACK-Seamless-Coop-*.zip` from
+   [Releases](https://github.com/MuriloDagustin/black-seamless-coop/releases/latest).
+2. **Extract** it anywhere (not inside *Program Files*).
+3. **Put your own copy of Black** in the `assets` folder: the `.iso` file, or the extracted disc files.
+4. **Run `BLACK.exe`**, press **F10 → CO-OP**, and host or join.
 
-Every player needs **the same build**. The easiest way: one person builds it and shares the
-`out\build\release` folder (`BLACK.exe` and its DLLs, without the game). Each player puts their **own** copy
-of the game in an `assets` folder next to `BLACK.exe`: the `.iso` file or the extracted disc files.
+That's it: no installer, no tools. Everyone must use **the same release**.
+
+The release plays over LAN or by IP. Online rooms by code (Epic Online Services) are not in it; see
+[Online rooms](#online-rooms) below.
 
 ## Playing together
 
@@ -45,8 +39,11 @@ Press **F10 → CO-OP** in the game:
 Over the internet the host must be reachable on **UDP port 45410**: a port forward on the host's router
 (with `BLACK.exe` allowed through the Windows firewall), or a virtual LAN such as Tailscale or ZeroTier.
 
-**Online rooms by code** (no port forwarding) work through Epic Online Services, but only in a build made
-with your own free Epic developer account and the EOS SDK. See [docs/online.md](docs/online.md).
+### Online rooms
+
+**Rooms by code** (no port forwarding) work through Epic Online Services, but only in a build you make
+yourself with your own free Epic developer account and the EOS SDK. See [docs/online.md](docs/online.md)
+and [Build it yourself](#build-it-yourself).
 
 ### Controls
 
@@ -99,6 +96,20 @@ Not yet: cutscenes in sync, vehicles.
 ---
 
 ## For developers
+
+### Build it yourself
+
+Only needed to change the code or to add online rooms. Install Windows 10/11 64-bit,
+[git](https://git-scm.com/download/win), [Python 3](https://www.python.org) and Visual Studio 2022 or later with
+*Desktop development with C++*, *C++ Clang tools* and *C++ CMake tools*, then:
+
+```
+setup.bat black-recomp "C:\path	o\Black.iso"
+black-recompuild.bat
+```
+
+The game is `black-recomp\outuildelease\BLACK.exe`. The first build recompiles the whole game and
+takes a while.
 
 ### What the setup does
 

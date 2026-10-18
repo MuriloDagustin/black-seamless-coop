@@ -16,23 +16,29 @@ construído em cima do próprio código do jogo, então espere alguns probleminh
 
 ## Começo rápido
 
-1. **Instale as ferramentas** (uma vez só): Windows 10/11 64 bits, [git](https://git-scm.com/download/win),
-   [Python 3](https://www.python.org) e Visual Studio 2022 ou mais novo com *Desenvolvimento para desktop
-   com C++*, *Ferramentas Clang do C++* e *Ferramentas CMake do C++*.
-2. **Baixe este repositório** (botão verde *Code* → *Download ZIP*, ou `git clone`).
-3. **Rode o setup** com a sua imagem de disco do Black:
-   ```
-   setup.bat black-recomp "C:\caminho\para\Black.iso"
-   ```
-   Ele baixa a port e o recompilador nas versões em que este mod foi testado, aplica o mod e extrai o seu
-   jogo em `black-recomp\assets`.
-4. **Compile**: rode `black-recomp\build.bat`. A primeira compilação recompila o jogo inteiro e demora.
-5. **Jogue**: `black-recomp\out\build\release\BLACK.exe`.
+1. **Baixe** o `BLACK-Seamless-Coop-*.zip` mais recente em
+   [Releases](https://github.com/MuriloDagustin/black-seamless-coop/releases/latest).
+2. **Extraia** em qualquer lugar (fora de *Arquivos de Programas*).
+3. **Coloque a sua própria cópia do Black** na pasta `assets`: o arquivo `.iso` ou os arquivos do disco
+   extraídos.
+4. **Abra o `BLACK.exe`**, aperte **F10 → CO-OP** e crie ou entre numa partida.
 
-Todos os jogadores precisam da **mesma build**. O jeito mais fácil: uma pessoa compila e passa a pasta
-`out\build\release` (o `BLACK.exe` e as DLLs dele, sem o jogo) para os outros. Cada jogador coloca a
-**própria** cópia do jogo numa pasta `assets` ao lado do `BLACK.exe`: o arquivo `.iso` ou os arquivos do
-disco extraídos.
+Só isso: sem instalador e sem ferramentas. Todos precisam usar **a mesma versão**.
+
+A versão pronta joga por rede local ou por IP. As salas online por código (Epic Online Services) não vêm
+nela; veja [Salas online](#salas-online) abaixo.
+
+### Compilar você mesmo (opcional)
+
+Só para mexer no código ou ter as salas online. Instale git, Python 3 e o Visual Studio 2022 ou mais novo
+com *Desenvolvimento para desktop com C++*, *Ferramentas Clang do C++* e *Ferramentas CMake do C++*, e rode:
+
+```
+setup.bat black-recomp "C:\caminho\para\Black.iso"
+black-recompuild.bat
+```
+
+O jogo fica em `black-recomp\outuildelease\BLACK.exe`. A primeira compilação demora.
 
 ## Jogando junto
 
@@ -47,8 +53,10 @@ Pela internet o host precisa estar acessível na **porta UDP 45410**: um redirec
 roteador do host (com o `BLACK.exe` liberado no firewall do Windows), ou uma rede virtual como Tailscale ou
 ZeroTier.
 
-**Salas online por código** (sem redirecionar porta) funcionam pelo Epic Online Services, mas só numa build
-feita com a sua própria conta gratuita de desenvolvedor da Epic e o SDK do EOS. Veja
+### Salas online
+
+**Salas por código** (sem redirecionar porta) funcionam pelo Epic Online Services, mas só numa build que
+você compila com a sua própria conta gratuita de desenvolvedor da Epic e o SDK do EOS. Veja
 [docs/online.md](docs/online.md) (em inglês).
 
 ### Controles
