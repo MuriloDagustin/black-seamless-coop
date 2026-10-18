@@ -474,6 +474,21 @@ std::string Run(const std::string& line) {
         return result;
     }
     if (c == "npcs") return Npcs();
+    if (c == "attacker") {  // attacker 0|1: a partner's bullet's hit is its body's (1, default) or this player's
+        coop::npcs::SetAttackerFix(a.size() > 1 && a[1] == "1");
+        return "ok";
+    }
+    if (c == "npchp" && a.size() == 3) {  // npchp <name hex> <health>: a character's health, by its name
+        uint64_t name = std::strtoull(a[1].c_str(), nullptr, 16);
+        uint32_t pool = R32(kPool);
+        for (int i = 0; pool && i < kChars; i++) {
+            uint32_t ch = pool + kPoolChars + uint32_t(i) * kCharSize;
+            if (R32(ch + kCharState) != 0 || (uint64_t(R32(ch + kCharName + 4)) << 32 | R32(ch + kCharName)) != name) continue;
+            G<float>(ch + kCharHealth) = float(std::atof(a[2].c_str()));
+            return "ok s" + std::to_string(i);
+        }
+        return "error no such character";
+    }
     if (c == "faultprobe" && a.size() == 2 && a[1] == "guest-read") {
         LOGR("ctl: intentional guest fault for diagnostic regression");
         return std::to_string(R32(0x20));  // only available with --coop-control

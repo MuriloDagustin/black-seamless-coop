@@ -24,7 +24,8 @@ void LevelReset();
 bool IsBody(uint32_t ch);  // the partner's body: no world event, no puppet
 uint32_t Body();           // the partner's body's character, 0 when none
 bool Puppets();            // joining copy: the host's enemies are puppets here now (the host heard)
-bool HostsEnemies();       // host: its enemies are the partner's puppets
+bool HostsEnemies();
+void SetAttackerFix(bool on);  // the test channel       // host: its enemies are the partner's puppets
 bool IsHostOwned(uint32_t ch);  // joining copy: a puppet of the host's
 
 struct Counters {

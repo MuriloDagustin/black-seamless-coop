@@ -21,6 +21,7 @@
 #include "core/log.h"
 #include "game/coop.h"
 #include "game/coop_npcs.h"
+#include "game/coop_shots.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
@@ -108,6 +109,7 @@ struct Hit {
 std::unordered_map<uint64_t, Hit> g_hits;
 
 bool g_host = false, g_puppets = false, g_bodies = false;
+bool g_attacker_fix = true;  // a partner's bullet's hit is its body's (the test channel turns it off to compare)
 
 // the partner's body: an ally made here (as the ally spawn 0x1B29D0 makes one, 0x1AF880) and driven from the
 // partner's states, the host's enemies seeing it as one of the squad (an empty squad slot during their perception)
@@ -398,6 +400,8 @@ uint32_t Body() { return BodyAlive() ? g_body : 0; }
 bool Puppets() { return Owning(); }
 
 bool HostsEnemies() { return g_host; }
+
+void SetAttackerFix(bool on) { g_attacker_fix = on; }
 
 bool IsHostOwned(uint32_t ch) { return HostOwned(ch); }
 
@@ -709,6 +713,17 @@ X86_FUNC(sub_001CCBB0) {
 X86_EXTERN_FUNC(__imp__sub_001E74B0);
 X86_FUNC(sub_001E74B0) {
     if (IsBody(ctx.ecx)) return Return(ctx, 0, 7);  // the partner's, hurt on its own copy
+    // the attacker (its sixth argument, [ebp+0x1C]: told to the victim's AI, 0x1BE350, and the kill's score): a
+    // partner's bullet here is fired with a weapon of this copy's player, yet it is the partner's body's, so the enemy
+    // it hurts turns on the partner and not on the host's player
+    if (g_host && g_attacker_fix && coop::shots::SteppingPartner() && BodyAlive()) {
+        uint32_t world = R32(kWorld);
+        if (world && R32(ctx.esp + 0x18) == world + layout::kWorldPlayer) {
+            W32(ctx.esp + 0x18, g_body);
+            static int told = 0;
+            if (told++ < 8) LOGR("npc: %016llX hurt by partner %d's body", (unsigned long long)NameOf(ctx.ecx), coop::CurrentPartner());
+        }
+    }
     if (HostOwned(ctx.ecx) && !coop::world::Applying()) {
         G<uint8_t>(ctx.ecx + kCharHit) = 1;
         return Return(ctx, 0, 7);
