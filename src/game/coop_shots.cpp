@@ -3,6 +3,8 @@
 // never hits the player itself (only rays with flag 8 test it, 0x1CDECB) and leaves its ammo, recoil and HUD alone.
 // The partner's bullets live in a pool of our own, stepped beside the game's, so they never take the player's slots.
 #include <bit>
+#include <array>
+#include "game/coop.h"
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -105,17 +107,30 @@ bool g_replaying = false;  // our own spawn calls: not taken as the player's
 // sender
 bool g_open = false;
 Event g_event{};
-uint32_t g_seq = 0;
+
 struct Stamped {
     uint64_t at;
     Event event;
 };
-std::deque<Stamped> g_pending;  // to the partner until acknowledged, or back to this copy for the echo
-
-// receiver
-uint32_t g_taken = 0;
-std::deque<Stamped> g_queue;  // to fire on the next bullet step
-uint32_t g_pool = 0;          // the partner's bullets: 0x1DB7B0 and 0x1E26E0 read only its +0x6E0
+struct ShotChannel {
+    uint32_t seq = 0, taken = 0, pool = 0;
+    std::deque<Stamped> pending, queue;
+    uint32_t flash = 0, slot = 0, slot_array = 0, bound_lo = 0, bound_hi = 0;
+    bool slot_ours = false;
+};
+std::array<ShotChannel, coop::kMaxPlayers> g_channels;
+ShotChannel& CurrentChannel() { return g_channels[coop::CurrentPartner()]; }
+#define g_seq (CurrentChannel().seq)
+#define g_taken (CurrentChannel().taken)
+#define g_pending (CurrentChannel().pending)
+#define g_queue (CurrentChannel().queue)
+#define g_pool (CurrentChannel().pool)
+#define g_flash (CurrentChannel().flash)
+#define g_slot (CurrentChannel().slot)
+#define g_slot_array (CurrentChannel().slot_array)
+#define g_bound_lo (CurrentChannel().bound_lo)
+#define g_bound_hi (CurrentChannel().bound_hi)
+#define g_slot_ours (CurrentChannel().slot_ours)
 Counters g_count;
 
 // fire with: a weapon and its gun per type, this process's own
@@ -124,12 +139,12 @@ struct Ghost {
 };
 Ghost g_ghosts[256];
 uint32_t g_buffers = 0;  // origin, dir, end: 16 aligned vectors
-uint32_t g_flash = 0;    // the block the flash follows, 0xB0 bytes
+
 // the gunshot slot, the slots' array it came from, the name it is bound to (and the one bound in its stead)
-uint32_t g_slot = 0, g_slot_array = 0;
-bool g_slot_ours = false;  // false once handed to an enemy's gun that found no free one
+
+
 bool g_taking = false;     // our own take of a slot
-uint32_t g_bound_lo = 0, g_bound_hi = 0;
+
 
 uint64_t NowMs() {
     using namespace std::chrono;
@@ -460,8 +475,10 @@ void Incoming(const uint8_t* p, int bytes, int count, int8_t level, uint64_t now
 uint32_t Taken() { return g_taken; }
 
 void Reset() {
-    g_taken = 0;
+    g_taken = g_seq = 0;
+    g_pending.clear();
     DropQueue();
+    if (g_pool) for (int b = 0; b < kBulletCount; b++) G<uint8_t>(Bullet(b) + kBulletLive) = 0;
 }
 
 void Echo(uint64_t now) {
@@ -516,12 +533,16 @@ X86_FUNC(sub_001DBD50) {
     __imp__sub_001DBD50(ctx, base);
     g_open = false;
     if (!g_event.count) return;  // a rocket, a grenade: not bullets
-    g_event.seq = ++g_seq;
     g_count.sent++;
     uint64_t now = NowMs();
     g_event.ms = uint32_t(now);
-    g_pending.push_back({now, g_event});
-    if (g_pending.size() > 64) g_pending.pop_front();
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player) || (g_echo && player == coop::CurrentPartner())) {
+        coop::PartnerScope scope(player);
+        Event copy = g_event;
+        copy.seq = ++g_seq;
+        g_pending.push_back({now, copy});
+        if (g_pending.size() > 64) g_pending.pop_front();
+    }
 }
 
 // A player's bullet: ecx its origin, edx [kArmoury]; stack: the gun, the direction, range, speed, flags (ret 0x14).
@@ -555,12 +576,14 @@ X86_EXTERN_FUNC(__imp__sub_001E28C0);
 X86_FUNC(sub_001E28C0) {
     uint32_t world = R32(kWorld);
     if (world) coop::world::Tick(ctx);  // the partner's world events, after the characters' update
+    for (int player = 0; player < coop::kMaxPlayers; player++) {
+        coop::PartnerScope scope(player);
     // the bullets read their owner's weapon: none in hand, none fired or stepped
     bool ready = world && R32(Player() + kPlayerWeapon) && TypeTable();
     if (ready && !g_pool) {
         g_pool = mem::AllocSystem(kPoolSize, 16);
         std::memset(HostPtr(g_pool), 0, kPoolSize);
-        g_buffers = mem::AllocSystem(48, 16);
+        if (!g_buffers) g_buffers = mem::AllocSystem(48, 16);
     }
     if (ready) {
         int8_t level = G<int8_t>(world + kWorldLevel);
@@ -575,6 +598,7 @@ X86_FUNC(sub_001E28C0) {
     } else {
         DropQueue();
     }
+    }
     __imp__sub_001E28C0(ctx, base);
 }
 
@@ -583,18 +607,25 @@ X86_FUNC(sub_001E28C0) {
 X86_EXTERN_FUNC(__imp__sub_0013FB70);
 X86_FUNC(sub_0013FB70) {
     __imp__sub_0013FB70(ctx, base);
-    if (ctx.eax || g_taking || !SlotValid()) return;
-    Clear(g_slot, true);
-    ctx.eax = g_slot;
-    g_slot = 0;
-    g_slot_ours = false;
-    g_bound_lo = g_bound_hi = 0;
+    if (ctx.eax || g_taking) return;
+    for (int player = 0; player < coop::kMaxPlayers; player++) {
+        coop::PartnerScope scope(player);
+        if (!SlotValid()) continue;
+        Clear(g_slot, true);
+        ctx.eax = g_slot;
+        g_slot = 0;
+        g_slot_ours = false;
+        g_bound_lo = g_bound_hi = 0;
+        break;
+    }
 }
 
 // The level loader's bullet reset, esi the armoury, plain ret; its one call is 0x1EDE4C. Ours go with the game's.
 X86_EXTERN_FUNC(__imp__sub_001CEED0);
 X86_FUNC(sub_001CEED0) {
     __imp__sub_001CEED0(ctx, base);
+    for (int player = 0; player < coop::kMaxPlayers; player++) {
+        coop::PartnerScope scope(player);
     if (g_pool)
         for (int b = 0; b < kBulletCount; b++) G<uint8_t>(Bullet(b) + kBulletLive) = 0;
     // the gunshot's slot given back: its sound set is of the level left
@@ -603,6 +634,7 @@ X86_FUNC(sub_001CEED0) {
     g_slot_ours = false;
     g_bound_lo = g_bound_hi = 0;
     DropQueue();
+    }
     coop::world::LevelReset();
 }
 

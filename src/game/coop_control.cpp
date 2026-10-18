@@ -17,6 +17,7 @@
 //   log <text>                    a line in this copy's log
 //   peek / peekf <addr> [n]       n dwords, hex or floats; addr hex, or @player+hex, @world+hex
 //   pokef <addr> <f>...           floats written there
+//   mission <level> <difficulty> native asynchronous mission load (difficulty 0..3)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -31,6 +32,7 @@
 #include "core/log.h"
 #include "game/coop.h"
 #include "game/coop_control.h"
+#include "game/coop_life.h"
 #include "game/coop_net.h"
 #include "game/coop_npcs.h"
 #include "game/coop_shots.h"
@@ -39,6 +41,8 @@
 #include "xdk/hle.h"
 
 using namespace kernel;
+namespace sprint { void Force(bool on); }
+
 using layout::kWorld;
 using layout::kWorldPlayer;
 
@@ -175,6 +179,10 @@ std::string State() {
     std::snprintf(buf, sizeof buf, "frame=%u level=%d unit=%d play=%d page=%s", R32(kFrameCount),
                   world ? int(G<int8_t>(world + kWorldLevel)) : -1, world ? int(R32(world + kWorldUnit)) : -1,
                   InPlay() ? 1 : 0, PageName().c_str());
+    s += buf;
+    uint32_t game = R32(0x2D45F0);
+    std::snprintf(buf, sizeof buf, " difficulty=%u load=%u joining=%d", game ? R32(game + 0x2014C) : 0,
+                  world::Load(), coop::JoiningMission() ? 1 : 0);
     s += buf;
     if (world) {
         uint32_t p = Player();
@@ -397,11 +405,12 @@ void AimStep() {
 
 // the player's body there: its matrix's position row is where the character controller takes it from, and the
 // position a frame ago goes with it, so no trigger sweeps the way between
-void Teleport(const float to[3]) {
+// walk: the position a frame ago kept, as a step there would leave it (the triggers sweep from it)
+void Teleport(const float to[3], bool walk = false) {
     uint32_t world = R32(kWorld);
     float* feet = &G<float>(Player() + kPlayerFeet);
     float* last = &G<float>(world + kWorldLastPos);
-    for (int i = 0; i < 3; i++) feet[i] = to[i], last[i] = to[i];
+    for (int i = 0; i < 3; i++) feet[i] = to[i], last[i] = walk ? last[i] : to[i];
 }
 
 // hex, or @player+hex / @world+hex
@@ -423,8 +432,27 @@ std::string Run(const std::string& line) {
     uint64_t now = NowMs();
     if (c == "ping") return "pong frame=" + std::to_string(R32(kFrameCount));
     if (c == "state") return State();
+    if (c == "players") return coop::Players();
+    if (c == "nick") {
+        if (line.size() > 5) coop::RequestNickname(line.substr(5));
+        return coop::GetSession().nickname;
+    }
+    if (c == "markers") {
+        std::string result;
+        for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+            coop::PartnerScope scope(player);
+            coop::Marker marker;
+            if (coop::RemoteMarker(marker)) result += std::string(marker.text) + "\n";
+        }
+        return result.empty() ? "none" : result;
+    }
     if (c == "coop") {
         if (a.size() > 1 && a[1] == "stop") coop::RequestStop();
+        else if (a.size() > 1 && a[1] == "online") {
+            if (a.size() == 3 && a[2] == "host") coop::RequestOnline(coop::Role::Host);
+            else if (a.size() == 4 && a[2] == "join") coop::RequestOnline(coop::Role::Join, a[3]);
+            else return "error coop online host|join <code>";
+        }
         else if (a.size() > 1 && a[1] == "search")
             coop::RequestSearch(uint16_t(std::clamp(a.size() > 2 ? std::atoi(a[2].c_str()) : 45410, 1, 65535)));
         else if (a.size() > 1 && (a[1] == "host" || a[1] == "join")) {
@@ -438,12 +466,47 @@ std::string Run(const std::string& line) {
         coop::Session session = coop::GetSession();
         std::string result = session.status + " running=" + std::to_string(session.running) +
                              " pending=" + std::to_string(session.pending) + " error=" + session.error;
+        result += " online=" + std::to_string(session.online) +
+                  " available=" + std::to_string(session.online_available) + " code=" + session.room_code;
         for (const auto& server : session.servers)
             result += "\n" + server.address + ":" + std::to_string(server.port) + " " + server.name +
                       (server.busy ? " full" : " available");
         return result;
     }
     if (c == "npcs") return Npcs();
+    if (c == "faultprobe" && a.size() == 2 && a[1] == "guest-read") {
+        LOGR("ctl: intentional guest fault for diagnostic regression");
+        return std::to_string(R32(0x20));  // only available with --coop-control
+    }
+    if (c == "formationprobe") {
+        // A copied formation record, never a live AI's data. Reproduce the null
+        // anchor at 0x1A0086 recorded in Windows Error Reporting.
+        if (a.size() != 2 || (a[1] != "valid" && a[1] != "missing-anchor" && a[1] != "missing-group"))
+            return "error formationprobe valid|missing-anchor|missing-group";
+        uint32_t world = R32(kWorld), pool = R32(kPool), ctl = 0;
+        if (!world || !pool) return "error no world";
+        for (int i = 0; i < kChars && !ctl; i++) {
+            uint32_t ch = pool + kPoolChars + uint32_t(i) * kCharSize;
+            if (R32(ch + kCharState) == 0) ctl = R32(ch + 0x324);
+        }
+        if (!ctl) return "error no character";
+        static uint32_t scratch = mem::AllocSystem(0x100, 16);
+        std::memset(HostPtr(scratch), 0, 0x100);
+        uint32_t record = scratch, group = scratch + 0x40, out = scratch + 0x90;
+        W32(record, ctl);
+        W32(record + 0x10, a[1] == "missing-anchor" ? 0 : Player());
+        W32(record + 0x30, a[1] == "missing-group" ? 0 : group);
+        W32(group + 0x10, Player());
+        std::memcpy(HostPtr(group), HostPtr(Player() + kPlayerFeet), 16);
+        G<float>(group) += 1.0f;
+        std::memcpy(HostPtr(group + 0x30), HostPtr(Player() + kPlayerFeet), 16);
+        kernel::CallGuest(*g_ctx, 0x1A0050, {record, out});
+        char result[128];
+        std::snprintf(result, sizeof result, "position=%.5f,%.5f,%.5f anchor=%08X group=%08X",
+                      double(G<float>(out)), double(G<float>(out + 4)), double(G<float>(out + 8)),
+                      R32(record + 0x10), R32(record + 0x30));
+        return result;
+    }
     if (c == "objectives" || c == "objective") {
         uint32_t world = R32(kWorld), mgr = R32(kLogic);
         if (!world || !mgr) return "error no world";
@@ -495,7 +558,42 @@ std::string Run(const std::string& line) {
         LOGR("ctl: %s", buf);
         return buf;
     }
+    if (c == "trigger") {  // trigger <list.index | id hex>: its world to local (+0x70, rows), +0xA0, half sizes +0x130
+        if (a.size() < 2) return "error trigger <list.index|id>";
+        uint32_t t = FindTrigger(a[1]);
+        if (!t) return "error no such trigger";
+        std::string r = "armed=" + std::to_string(G<uint8_t>(t + 0x11C));
+        char buf[64];
+        for (uint32_t i = 0; i < 16; i++) {
+            std::snprintf(buf, sizeof buf, " %.4f", double(G<float>(t + 0x70 + i * 4)));
+            r += buf;
+        }
+        for (uint32_t i = 0; i < 3; i++) {
+            std::snprintf(buf, sizeof buf, " h%.3f", double(G<float>(t + 0x130 + i * 4)));
+            r += buf;
+        }
+        return r;
+    }
+    if (c == "sprint") {  // sprint 0|1: the sprint key held, as Shift is
+        sprint::Force(a.size() > 1 && a[1] == "1");
+        return "ok";
+    }
     if (c == "page") return PageName();
+    if (c == "die") {  // the player killed: its controller's event 5 (0x1D54C0), as a fatal hit sends it
+        uint32_t world = R32(kWorld);
+        if (!world || R32(world + kWorldPlayer + 0x384)) return "not alive";
+        G<float>(world + kWorldPlayer + 0x2F0) = 0;
+        static constexpr hle::Map kEvent = hle::Make({hle::ecx, hle::stack, hle::stack, hle::stack, hle::stack});
+        hle::Call(*g_ctx, 0x1D54C0, kEvent, {world + 0x520, 5, 0, 0, 0});
+        return "died";
+    }
+    if (c == "watch") {  // watch [next]: the partner this copy shows while down
+        if (a.size() > 1 && a[1] == "next") coop::life::WatchNext();
+        if (a.size() > 2 && a[1] == "ahead") coop::life::WatchAhead(float(std::atof(a[2].c_str())));
+        return "watching " + std::to_string(coop::life::Watching());
+    }
+    if (c == "revive") return coop::life::Revive(*g_ctx, "asked") ? "revived" : "not down";
+    if (c == "down") return coop::life::Down() ? (coop::life::HoldDeath() ? "down, held" : "down, last") : "alive";
     if (c == "rescue") {  // the players' "get me out of here", as F8 asks it
         coop::AskRescue();
         return "asked";
@@ -507,6 +605,11 @@ std::string Run(const std::string& line) {
         hle::Call(*g_ctx, a[1] == "fail" ? 0x1F45C0 : 0x1F45B0, kOne, {game + 0x20F78, 0});
         LOGR("ctl: flow %s", a[1].c_str());
         return "asked " + a[1];
+    }
+    if (c == "mission") {
+        if (a.size() != 3) return "error mission <level> <difficulty 0..3>";
+        return coop::LoadMission(*g_ctx, std::atoi(a[1].c_str()), std::atoi(a[2].c_str()))
+                   ? "asked mission" : "error mission invalid or game transitioning";
     }
     if (c == "level") {  // the next level load is of that level, from its first unit (as the mission select, 0x11B9DC)
         if (a.size() < 2) return "error level <n>";
@@ -616,7 +719,7 @@ std::string Run(const std::string& line) {
         } else {
             return "error teleport <x> <y> <z> | teleport partner";
         }
-        Teleport(to);
+        Teleport(to, a.size() >= 5 && a[4] == "walk");
         char buf[96];
         std::snprintf(buf, sizeof buf, "teleported to %.2f,%.2f,%.2f", double(to[0]), double(to[1]), double(to[2]));
         LOGR("ctl: %s", buf);

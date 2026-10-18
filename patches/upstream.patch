@@ -1,3 +1,176 @@
+diff --git a/.gitignore b/.gitignore
+index 2196401..2ca463b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -26,3 +26,8 @@ black.toml
+ 
+ # Local temporary folder
+ .local
++
++# Optional EOS SDK and local product configuration
++/third_party/eos/
++coop-online.toml
++EOSSDK-*.dll
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3fe6d75..5fe2401 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -48,6 +48,23 @@ add_custom_target(build_info
+ set_source_files_properties(src/common/version.rc PROPERTIES
+     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_SOURCE_DIR}/src/common"
+     OBJECT_DEPENDS "${BUILD_INFO};${CMAKE_CURRENT_SOURCE_DIR}/src/common/europe.patch")
++set_source_files_properties(src/game/diagnostics.cpp PROPERTIES
++    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}"
++    OBJECT_DEPENDS "${BUILD_INFO}")
+ target_sources(Black PRIVATE src/common/version.rc)
+ add_dependencies(Black build_info)
+ set_target_properties(Black PROPERTIES OUTPUT_NAME BLACK)
++
++# EOS is opt-in: obtain the official C SDK under your Epic developer account.
++# Keep SDK files and product credentials local, outside version control.
++set(BLACK_EOS_SDK "" CACHE PATH "Extracted Epic Online Services C SDK directory")
++if(BLACK_EOS_SDK)
++    find_path(BLACK_EOS_INCLUDE eos_sdk.h PATHS "${BLACK_EOS_SDK}/SDK/Include" "${BLACK_EOS_SDK}/Include" NO_DEFAULT_PATH REQUIRED)
++    find_library(BLACK_EOS_LIBRARY NAMES EOSSDK-Win64-Shipping PATHS "${BLACK_EOS_SDK}/SDK/Lib" "${BLACK_EOS_SDK}/Lib" NO_DEFAULT_PATH REQUIRED)
++    find_file(BLACK_EOS_DLL EOSSDK-Win64-Shipping.dll PATHS "${BLACK_EOS_SDK}/SDK/Bin" "${BLACK_EOS_SDK}/Bin" NO_DEFAULT_PATH REQUIRED)
++    target_include_directories(Black PRIVATE "${BLACK_EOS_INCLUDE}")
++    target_link_libraries(Black PRIVATE "${BLACK_EOS_LIBRARY}")
++    target_compile_definitions(Black PRIVATE BLACK_WITH_EOS=1)
++    add_custom_command(TARGET Black POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
++        "${BLACK_EOS_DLL}" "$<TARGET_FILE_DIR:Black>/EOSSDK-Win64-Shipping.dll")
++endif()
+diff --git a/config/coop-online.example.toml b/config/coop-online.example.toml
+new file mode 100644
+index 0000000..ac5323e
+--- /dev/null
++++ b/config/coop-online.example.toml
+@@ -0,0 +1,12 @@
++# Copy beside BLACK.exe as coop-online.toml. Both PCs use the SAME product,
++# sandbox, deployment and restricted game-client credentials from your portal.
++# Never use an administrative / trusted-server client in a distributed build.
++product_id = ""
++sandbox_id = ""
++deployment_id = ""
++client_id = ""
++client_secret = ""
++# Choose your nickname in F10 > CO-OP; it is saved in black.toml.
++# Useful for connectivity testing. Normally direct P2P is attempted first and
++# EOS uses its relay when necessary. This is not a VPN or a dedicated game host.
++force_relay = false
+diff --git a/docs/online.md b/docs/online.md
+new file mode 100644
+index 0000000..77e7a37
+--- /dev/null
++++ b/docs/online.md
+@@ -0,0 +1,108 @@
++# Online co-op with EOS (optional)
++
++This integration supports **up to eight players**, including the host. A player
++still hosts the simulation on their PC. EOS supplies lobby discovery and P2P
++connectivity, with its relay available when a direct connection cannot be made.
++Players do not need a virtual LAN application or a separately hosted game server.
++
++**Status:** compiled with the official EOS C SDK 1.19.2.1 on Windows. Device ID
++login, real room creation and discovery were tested against EOS. LAN mission
++joining, shared objectives, locomotion and completion passed regression checks
++in the EOS-enabled build. Eight simultaneous LAN copies passed automatic mission
++joining, seven distinct remote bodies each, shooting from every player, shared
++and simultaneous objectives, full-room rejection, rejoining, completion and a
++map/difficulty change. Walking/running/idle clips also passed a UDP proxy test
++delivering movement states in 180 ms bursts. Eight-player EOS matches and
++direct/relayed connectivity between distinct PCs
++is still untested; a successful lobby lookup does not validate P2P transport.
++A normal build without the SDK keeps LAN/direct IP and shows online as unavailable.
++Do not treat a successful LAN test as validation of EOS or relay connectivity.
++
++## Product setup (your Epic developer account)
++
++1. Confirm with Epic that your intended use of an independently developed co-op
++   extension/recompilation is eligible. Do not describe yourself as the owner or
++   publisher of the original BLACK. Personal/noncommercial use alone does not
++   settle the developer agreement's rights requirements.
++2. In the [Developer Portal](https://dev.epicgames.com/portal/), create your
++   organization and product, and select the sandbox and deployment for your tests.
++3. Create a **game client** and a custom client policy with **User required**
++   enabled. Under **Lobbies**, enable `connect`, `readLobby` and `findLobbies`.
++   This policy does not need Sessions or administrative Connect lookup actions.
++   The portal does not expose a separate P2P feature switch. Do not use a
++   trusted-server or administrative client in the executable.
++4. Download the **C SDK for Windows** from that portal and extract it locally, for
++   example to `C:/dev/eos-sdk`. This is an optional dependency, separate from the
++   Xbox recompilation SDK. Do not commit the EOS SDK or its redistributable files.
++5. Copy `config/coop-online.example.toml` beside `BLACK.exe` as
++   `coop-online.toml`, then fill the five product/client fields from your portal.
++   Keep this local file out of Git. Use the same product, sandbox, deployment and
++   game-client configuration on all PCs. Choose each player's nickname in
++   **F10 → CO-OP → Nickname**; this is saved separately in `black.toml`.
++
++This prototype uses **EOS Connect Device ID** for the player identity, with no
++Epic friends list, account overlay, store integration, voice chat or anti-cheat.
++Epic Account Services login/friends and its brand review are separate features.
++**User required** means an authenticated product user, including an automatic
++Device ID user; it does not require signing into an Epic Games account. Internal
++Connect authentication is still required by EOS Lobbies and P2P.
++Two processes under the same Windows account were observed to share their Device
++ID. Joining your own device's room is rejected with a message; use LAN for two
++copies on one PC. The intended online test is on two distinct PCs.
++
++## Build
++
++Add `-DBLACK_EOS_SDK=C:/dev/eos-sdk` to the existing CMake configuration, then build.
++The directory must contain `SDK/Include/eos_sdk.h`,
++`SDK/Lib/EOSSDK-Win64-Shipping.lib` and `SDK/Bin/EOSSDK-Win64-Shipping.dll` (or the
++equivalent `Include`, `Lib`, `Bin` paths directly under the selected directory).
++CMake copies the EOS DLL beside the executable. Distribute the components under
++the SDK's terms, including any notices they require.
++
++Omit `BLACK_EOS_SDK` for the standard build without EOS. Merely copying the DLL
++beside a standard executable does not enable the integration.
++
++## Play
++
++1. Host: open **F10 → CO-OP → Create online room**. Wait for the eight-character
++   room code to appear, then send that code privately to your friend.
++2. Partner: **F10 → CO-OP → Join by code**. Both players need the same game image,
++   co-op protocol/build and EOS product configuration.
++3. Once the existing game handshake finishes, the partner follows the host's map,
++   difficulty and objective progress automatically.
++4. **Leave / stop server** cancels pending setup as well as an established room.
++   Starting the executable never reconnects automatically.
++
++The room has eight slots. The host keeps the physical P2P connections and routes
++client-to-client updates; clients only need a connection to the host. Codes are
++random lobby search attributes, not passwords
++or an authorization system for a public matchmaking service. A closed host room
++does not migrate the running BLACK mission to the other player. Join again after
++the host creates another room.
++
++For a friend's existing game installation, copy the same `BLACK.exe`,
++`EOSSDK-Win64-Shipping.dll`, restricted `coop-online.toml`, and the SDK's third-party
++notices (locally copied to `EOS-ThirdPartyNotices`) next to their normal game
++files. Each player supplies their own game assets. Keep product credentials
++out of public repositories; never include developer/admin credentials.
++
++Optional command line: `--coop-online host` or `--coop-online ABCD2345`.
++`--coop-eos-config C:/path/coop-online.toml` selects a local configuration file.
++The ordinary `--coop host` / `--coop join --join <IP>` still use UDP/direct IP.
++
++## Validation before calling it ready
++
++- Compile with the actual SDK, then check SDK login and all callback cleanup paths.
++- Use two PCs on different internet connections to create/join a room.
++- Set `force_relay = true` on both test PCs to validate relayed connectivity;
++  then use `false` for normal direct-or-relayed connections.
++- Check a wrong/full/closed room, a different protocol/image, cancellation during
++  login/search/join, host departure and a new room after leaving.
++- Run the existing objective, locomotion, auto-mission and completion checks.
++- Keep automated game copies hidden, with `--mute`, and use UDP test controls.
++
++References: [EOS getting started](https://dev.epicgames.com/docs/epic-online-services/eos-get-started/eos-get-started-reference),
++[client policies](https://dev.epicgames.com/docs/epic-online-services/eos-fundamentals/client-and-client-policy/client-policy-guide),
++[Connect](https://dev.epicgames.com/docs/epic-online-services/eos-fundamentals/connect-interface),
++[P2P](https://dev.epicgames.com/docs/epic-online-services/multiplayer/nat-p2p-interface),
++[developer agreement](https://onlineservices.epicgames.com/services/terms/agreements).
 diff --git a/src/audio/xaudio2.cpp b/src/audio/xaudio2.cpp
 index ec16f14..a5b910d 100644
 --- a/src/audio/xaudio2.cpp
@@ -43,19 +216,26 @@ index 4cf9854..45fb2f2 100644
      g_focus_paused = true;
      audio::SetPaused(true);
 diff --git a/src/common/game_info.cpp b/src/common/game_info.cpp
-index d839025..52324da 100644
+index d839025..30d0521 100644
 --- a/src/common/game_info.cpp
 +++ b/src/common/game_info.cpp
-@@ -17,6 +17,8 @@
+@@ -13,10 +13,15 @@
+ 
+ #include "app/app.h"
+ #include "audio/output.h"
++#include "core/log.h"
+ #include "common/menu.h"
  #include "common/monitor.h"
  #include "common/mouse_keyboard.h"
  #include "common/options.h"
 +#include "game/coop.h"
 +#include "game/coop_control.h"
++#include "game/coop_life.h"
++#include "game/diagnostics.h"
  
  namespace game {
  
-@@ -56,6 +58,7 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+@@ -56,6 +61,7 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
                  return true;
              }
              if (msg == WM_KEYDOWN && wp == VK_ESCAPE && MenuOpen() && !Capturing()) ToggleMenu();
@@ -63,7 +243,22 @@ index d839025..52324da 100644
              break;
          case WM_SYSCOMMAND:
              // a bound Alt must not open the window menu
-@@ -84,9 +87,25 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+@@ -63,6 +69,14 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
+                 *result = 0;
+                 return true;
+             }
++            if ((wp & 0xFFF0) == SC_CLOSE) LOGR("window: closed by Windows (Alt+F4, the title bar, the taskbar)");
++            break;
++        case WM_CLOSE:
++            LOGR("window: close asked");
++            break;
++        case WM_QUERYENDSESSION:
++        case WM_ENDSESSION:
++            LOGR("window: Windows is ending the session");
+             break;
+         case WM_CHAR:
+             input::OnChar(unsigned(wp));
+@@ -84,16 +98,45 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
      return false;
  }
  
@@ -89,7 +284,15 @@ index d839025..52324da 100644
      if (port == 0) pad.connected = true;
      if (app::MenuOpen()) pad = input::Pad{.connected = pad.connected};
      else if (port == 0) input::Keyboard(pad);
-@@ -94,6 +113,11 @@ void Pad(int port, input::Pad& pad) {
++    // co-op, down: A, a click, Space or the right arrow watches the next living partner, the left arrow the one before
++    uint16_t watch = pad.buttons;
++    if (port == 0 && !app::MenuOpen()) {
++        auto key = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
++        if (key(VK_LBUTTON) || key(VK_SPACE) || key(VK_RIGHT)) watch |= 0x1000;
++        if (key(VK_LEFT)) watch |= 0x0004;
++    }
++    coop::life::PadWatch(port, watch);
+ }
  
  // no vibration while the keyboard and mouse are in use
  void Rumble(int port, uint16_t& left, uint16_t& right) {
@@ -101,7 +304,19 @@ index d839025..52324da 100644
      if (port != 0 || !input::KeyboardActive()) return;
      left = 0;
      right = 0;
-@@ -118,6 +142,7 @@ void Init() {
+@@ -104,6 +147,7 @@ void Load(const void* table) {
+     const toml::table& t = *static_cast<const toml::table*>(table);
+     Options& o = Opt();
+     o.monitor = t["monitor"].value_or(o.monitor);
++    o.coop_nickname = coop::CleanNickname(t["coop_nickname"].value_or(o.coop_nickname));
+     o.mouse_sensitivity = float(t["mouse_sensitivity"].value_or(double(o.mouse_sensitivity)));
+     std::string language = t["language"].value_or(o.language);
+     bool known = std::find(std::begin(kLanguages), std::end(kLanguages), language) != std::end(kLanguages);
+@@ -115,15 +159,18 @@ void Load(const void* table) {
+ 
+ // after the settings load, before boot
+ void Init() {
++    diagnostics::Init();
      BootLanguage();  // latched before the panel can change the setting
      input::LoadBindings();
      audio::SetOutputMode(Opt().audio_output);
@@ -109,7 +324,22 @@ index d839025..52324da 100644
  }
  
  void Save(void* table) {
-@@ -170,7 +195,9 @@ const app::GameInfo app::kGame = {
+     toml::table& t = *static_cast<toml::table*>(table);
+     const Options& o = Opt();
+     t.insert("monitor", o.monitor);
++    t.insert("coop_nickname", o.coop_nickname);
+     t.insert("mouse_sensitivity", double(o.mouse_sensitivity));
+     t.insert("language", o.language);
+     toml::table keys;
+@@ -163,6 +210,7 @@ const app::GameInfo app::kGame = {
+                 {"invert_mouse", &game::Opt().invert_mouse, nullptr},
+                 {"hold_aim", &game::Opt().hold_aim, nullptr},
+                 {"walk_speed", nullptr, &game::Opt().walk_speed},
++                {"sprint_speed", nullptr, &game::Opt().sprint_speed},
+                 {"fov", nullptr, &game::Opt().fov},
+                 {"msaa", nullptr, &game::Opt().msaa},
+                 {"smaa", &game::Opt().smaa, nullptr},
+@@ -170,7 +218,9 @@ const app::GameInfo app::kGame = {
                  {"draw_distance", nullptr, &game::Opt().draw_distance},
                  {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
                  {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
@@ -121,7 +351,7 @@ index d839025..52324da 100644
      .save = game::Save,
      .init = game::Init,
 diff --git a/src/common/menu.cpp b/src/common/menu.cpp
-index f5cc7c0..3921999 100644
+index f5cc7c0..901dd9c 100644
 --- a/src/common/menu.cpp
 +++ b/src/common/menu.cpp
 @@ -29,6 +29,7 @@
@@ -132,7 +362,36 @@ index f5cc7c0..3921999 100644
  
  namespace app {
  
-@@ -502,9 +503,10 @@ std::string KeyText(std::string keys) {
+@@ -226,7 +227,7 @@ void Changed(bool display) {
+ }
+ 
+ enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFpsCounter, kAniso, kReloadBlur,
+-             kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
++             kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kSprintSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
+              kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
+              kPauseOnFocusLoss, kFmvScale };
+ 
+@@ -271,6 +272,7 @@ const std::vector<Row>& InputRows() {
+         const input::Action* actions = input::Actions(&count);
+         for (size_t i = 0; i < count; i++) out.push_back({Kind::Bind, int(i), actions[i].label});
+         out.push_back({Kind::Value, kWalkSpeed, "WALK SPEED"});
++        out.push_back({Kind::Value, kSprintSpeed, "SPRINT SPEED"});
+         return out;
+     }();
+     return list;
+@@ -465,6 +467,11 @@ void StepInputRow(int id, int step, char (&text)[64]) {
+             if (step) o.walk_speed = uint32_t(StepRange(int(o.walk_speed), 10, 100, 5, step));
+             std::snprintf(text, sizeof(text), "%u%%", o.walk_speed);
+             break;
++        case kSprintSpeed:
++            // 100% (off) to 250% in steps of 10
++            if (step) o.sprint_speed = uint32_t(StepRange(int(o.sprint_speed), 100, 250, 10, step));
++            std::snprintf(text, sizeof(text), "%u%%", o.sprint_speed);
++            break;
+         case kLanguage: {
+             int count = int(std::size(game::kLanguages));
+             int i = 0;
+@@ -502,9 +509,10 @@ std::string KeyText(std::string keys) {
      return keys;
  }
  
@@ -144,7 +403,23 @@ index f5cc7c0..3921999 100644
  
  void RestoreDefaults(int page) {
      game::Options& o = game::Opt();
-@@ -653,7 +655,84 @@ void KeyRow(const Row& r) {
+@@ -513,6 +521,7 @@ void RestoreDefaults(int page) {
+         o.invert_mouse = false;
+         o.hold_aim = true;
+         o.walk_speed = game::Options{}.walk_speed;
++        o.sprint_speed = game::Options{}.sprint_speed;
+         input::ResetBindings();
+         return;
+     }
+@@ -523,6 +532,7 @@ void RestoreDefaults(int page) {
+     o.invert_mouse = keep.invert_mouse;
+     o.hold_aim = keep.hold_aim;
+     o.walk_speed = keep.walk_speed;
++    o.sprint_speed = keep.sprint_speed;
+     o.keys = keep.keys;
+     Changed(true);
+ }
+@@ -653,7 +663,118 @@ void KeyRow(const Row& r) {
      g_capture_armed = false;
  }
  
@@ -161,6 +436,40 @@ index f5cc7c0..3921999 100644
 +    if (session.running) ImGui::TextUnformatted(session.role == coop::Role::Host ? "Hosting" : "Partner");
 +    if (!session.error.empty()) ImGui::TextWrapped("%s", session.error.c_str());
 +    ImGui::Spacing();
++    static char nickname[coop::kNicknameBytes]{};
++    static bool nickname_initialized = false;
++    if (!nickname_initialized) {
++        std::snprintf(nickname, sizeof nickname, "%s", session.nickname.c_str());
++        nickname_initialized = true;
++    }
++    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18);
++    bool enter_nickname = ImGui::InputText("Nickname", nickname, sizeof nickname, ImGuiInputTextFlags_EnterReturnsTrue);
++    if (ImGui::IsItemDeactivatedAfterEdit() || enter_nickname) {
++        coop::RequestNickname(nickname);
++        std::snprintf(nickname, sizeof nickname, "%s", coop::CleanNickname(nickname).c_str());
++    }
++    ImGui::TextDisabled("Up to 20 characters. You can change it during the match.");
++    ImGui::Text("Players: %d / %d", session.players, session.capacity);
++    for (const auto& member : session.members)
++        ImGui::Text("%s%s%s", member.nickname.c_str(), member.local ? " (you)" : "", member.host ? " (host)" : "");
++    Section("ONLINE WITH FRIENDS");
++    static char room_code[24]{};
++    if (session.online && !session.room_code.empty()) {
++        ImGui::Text("Room code: %s", session.room_code.c_str());
++        ImGui::SameLine();
++        if (ImGui::Button("Copy code")) ImGui::SetClipboardText(session.room_code.c_str());
++    }
++    if (!session.online_available)
++        ImGui::TextWrapped("Online needs an EOS-enabled build and coop-online.toml. See docs/online.md.");
++    ImGui::BeginDisabled(!session.online_available || session.running || session.pending);
++    if (ImGui::Button("Create online room")) coop::RequestOnline(coop::Role::Host);
++    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14);
++    ImGui::InputText("Room code", room_code, sizeof room_code, ImGuiInputTextFlags_CharsUppercase);
++    ImGui::BeginDisabled(!room_code[0]);
++    if (ImGui::Button("Join by code")) coop::RequestOnline(coop::Role::Join, room_code);
++    ImGui::EndDisabled();
++    ImGui::EndDisabled();
++    Section("LAN / DIRECT IP");
 +    ImGui::BeginDisabled(session.running || session.pending);
 +    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 8);
 +    ImGui::InputInt("UDP port", &port, 0);
@@ -218,7 +527,7 @@ index f5cc7c0..3921999 100644
 +        coop::RequestStop();
 +    }
 +    ImGui::EndDisabled();
-+    ImGui::TextWrapped("Two players. Load the same mission on both copies. F8 brings you to your partner.");
++    ImGui::TextWrapped("Up to 8 players. Joining loads the host's mission and difficulty automatically. F8 brings you to your partner.");
 +}
 +
  void DrawRows(int page) {
@@ -229,7 +538,7 @@ index f5cc7c0..3921999 100644
      size_t count = 0;
      const Row* list = rows::Page(page, &count);
      for (size_t i = 0; i < count; i++) {
-@@ -665,6 +744,7 @@ void DrawRows(int page) {
+@@ -665,6 +786,7 @@ void DrawRows(int page) {
  }
  
  void Defaults() {
@@ -237,7 +546,7 @@ index f5cc7c0..3921999 100644
      g_capture = -1;
      if (g_page == kSettingsPage) g_display_held = false;
      RestoreDefaults(g_page);
-@@ -723,7 +803,9 @@ void DrawFooter(float em) {
+@@ -723,7 +845,9 @@ void DrawFooter(float em) {
      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(buttons_pad, 0.0f));
      if (ImGui::Button(Ui("Back", false).c_str(), ImVec2(bw, 0))) ToggleMenu();
      ImGui::SameLine();
@@ -248,10 +557,10 @@ index f5cc7c0..3921999 100644
      ImGui::BeginDisabled(!g_display_held);
      if (ImGui::Button(Ui("Apply", false).c_str(), ImVec2(bw, 0))) Apply();
 diff --git a/src/common/mouse_keyboard.cpp b/src/common/mouse_keyboard.cpp
-index 0039bd1..1f5108e 100644
+index 0039bd1..ee817d5 100644
 --- a/src/common/mouse_keyboard.cpp
 +++ b/src/common/mouse_keyboard.cpp
-@@ -24,6 +24,7 @@
+@@ -24,10 +24,12 @@
  #include "common/aspect.h"
  #include "common/menu.h"
  #include "common/options.h"
@@ -259,7 +568,28 @@ index 0039bd1..1f5108e 100644
  
  namespace input {
  
-@@ -232,7 +233,8 @@ std::string Join(const std::vector<int>& vks, bool labels = false) {
+ namespace {
++std::atomic<bool> g_sprint{false};  // the sprint key held, moving forward, in play
+ 
+ HWND g_hwnd = nullptr;
+ std::atomic<int> g_dx{0};
+@@ -64,6 +66,7 @@ struct Target {
+ };
+ constexpr int kHostKey = -2;
+ constexpr int kWalk = -3;
++constexpr int kSprint = -4;
+ constexpr int kFirstButtonBit = 8;
+ constexpr int kStart = 12;
+ constexpr int kFirstMoveKey = 16;
+@@ -76,6 +79,7 @@ constexpr Target kActions[] = {
+     {{"strafe_left", "STRAFE LEFT", "A"}, 18},
+     {{"strafe_right", "STRAFE RIGHT", "D"}, 19},
+     {{"walk", "WALK", "Alt"}, kWalk},
++    {{"sprint", "SPRINT", "Shift"}, kSprint},
+     {{"crouch", "CROUCH", "C"}, 14},
+     {{"fire", "FIRE", "LMB"}, 7},
+     {{"aim", "AIM", "RMB"}, 15},
+@@ -232,7 +236,8 @@ std::string Join(const std::vector<int>& vks, bool labels = false) {
  }
  
  bool Foreground() { return g_hwnd && GetForegroundWindow() == g_hwnd; }
@@ -269,7 +599,32 @@ index 0039bd1..1f5108e 100644
  bool Wheel(int vk) { return vk == kWheelUp || vk == kWheelDown; }
  bool Down(int vk) {
      if (Wheel(vk)) return NowMs() - g_wheel_ms[vk == kWheelDown] < kTapMs;
-@@ -421,8 +423,8 @@ void SetMenu(bool menu) {
+@@ -288,6 +293,7 @@ bool UpdateSettle(const Binds& binds) {
+ struct Held {
+     bool used = false;
+     bool walk = false;
++    bool sprint = false;
+     int stick[8] = {};  // move forward back left right, look up down left right
+ };
+ 
+@@ -305,6 +311,8 @@ Held PressActions(const Binds& binds, bool play, Pad& p) {
+         if (g_text && b != kStart) continue;
+         if (b == kWalk) {
+             held.walk = true;
++        } else if (b == kSprint) {
++            held.sprint = play;
+         } else if (b >= kFirstLookKey && !play) {
+             continue;
+         } else if (b >= kFirstMoveKey) {
+@@ -402,6 +410,7 @@ void Keyboard(Pad& p) {
+     float speed = held.walk ? float(game::Opt().walk_speed) / 100.0f : 1.0f;
+     if (int x = stick[3] - stick[2]) p.lx = int16_t(float(x) * speed * float(kStickMax));
+     if (int y = stick[0] - stick[1]) p.ly = int16_t(float(y) * speed * float(kStickMax));
++    g_sprint = held.sprint && !held.walk && stick[0] > stick[1];  // forward only
+     if (int x = stick[7] - stick[6]) p.rx = int16_t(x * kStickMax);
+     if (int y = stick[4] - stick[5]) p.ry = int16_t(y * kStickMax);
+     if (fixed_down || held.used) SetKeyboard(true);
+@@ -421,8 +430,8 @@ void SetMenu(bool menu) {
      if (g_menu.exchange(menu) != menu) RefreshCursor();
  }
  
@@ -280,16 +635,43 @@ index 0039bd1..1f5108e 100644
  
  bool Cursor(float& x, float& y, bool& down) {
      POINT p;
+@@ -444,6 +453,8 @@ bool Cursor(float& x, float& y, bool& down) {
+ 
+ int TakeWheel() { return g_wheel.exchange(0); }
+ 
++bool Sprinting() { return g_sprint && Active(); }
++
+ bool LeftButton() { return Active() && !g_settle && Down(VK_LBUTTON); }
+ 
+ void TapConfirm() { g_confirm_until = NowMs() + kTapMs; }
+diff --git a/src/common/mouse_keyboard.h b/src/common/mouse_keyboard.h
+index 5177717..ed5f118 100644
+--- a/src/common/mouse_keyboard.h
++++ b/src/common/mouse_keyboard.h
+@@ -46,6 +46,7 @@ bool CursorShown();            // in a menu with the keyboard or mouse used last
+ // the cursor in the shown frame, 0 to 1 across and down, and the left button; false while it is not shown
+ bool Cursor(float& x, float& y, bool& down);
+ int TakeWheel();               // wheel notches in the menus since the last call, up positive
++bool Sprinting();              // the sprint key held, moving forward (keyboard)
+ bool LeftButton();             // the left mouse button held in the game window
+ void TapConfirm();             // a short press of A on the pad itself
+ // a name being typed: the keys type (OnChar) and press nothing but the arrows and pause
 diff --git a/src/common/options.h b/src/common/options.h
-index 8c56e8b..fd64c46 100644
+index 8c56e8b..ac9f923 100644
 --- a/src/common/options.h
 +++ b/src/common/options.h
-@@ -30,6 +30,8 @@ struct Options {
+@@ -26,10 +26,14 @@ struct Options {
+     uint32_t fov = 70;  // horizontal degrees on a 4:3 frame, 70 is the game's
+     uint32_t viewmodel_fov = 70;  // the gun and arms, the same measure
+     uint32_t walk_speed = 50;  // percent of running, while the walk key is held
++    uint32_t sprint_speed = 140;  // percent of running, while the sprint key is held
+     uint32_t audio_output = 0;  // audio::kOutputAuto, kOutputStereo, kOutputSurround or kOutputMono
      std::string language = "int";  // one of kLanguages
      bool smaa = false;  // over the finished frame, HUD included; combines with msaa
      bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
 +    uint32_t coop = 0;  // co-op: 0 off, 1 host, 2 join the host at join_ip; --coop host|join for one copy
 +    uint32_t coop_port = 45410;  // UDP, the host's
++    std::string coop_nickname = "Player";
      std::map<std::string, std::string> keys;  // action id to key names, absent is the default
  };
  Options& Opt();
@@ -313,11 +695,146 @@ index 575cf99..d1a085e 100644
      uint32_t mode = game::Opt().ambient_occlusion;
      if (mode) d3d::Occlusion(&G<float>(kProjection), mode == 2);
  }
+diff --git a/src/game/diagnostics.cpp b/src/game/diagnostics.cpp
+new file mode 100644
+index 0000000..14b8114
+--- /dev/null
++++ b/src/game/diagnostics.cpp
+@@ -0,0 +1,66 @@
++// Record guest-memory faults before a library's unhandled-exception handler
++// gets control. This observer never handles an exception or resumes bad code.
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#include <dbghelp.h>
++
++#include <atomic>
++#include <cstdio>
++
++#include "app/app.h"
++#include "build_info.h"
++#include "core/log.h"
++#include "game/diagnostics.h"
++#include "kernel/kernel.h"
++
++namespace game::diagnostics {
++namespace {
++
++std::atomic_flag g_recorded = ATOMIC_FLAG_INIT;
++
++LONG WINAPI GuestFault(EXCEPTION_POINTERS* exception) {
++    const auto* record = exception->ExceptionRecord;
++    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2)
++        return EXCEPTION_CONTINUE_SEARCH;
++    uintptr_t start = reinterpret_cast<uintptr_t>(kernel::g_base);
++    uintptr_t address = record->ExceptionInformation[1];
++    auto* thread = kernel::Current();
++    if (!start || !thread || !thread->ctx || address < start || address - start > UINT32_MAX ||
++        g_recorded.test_and_set()) return EXCEPTION_CONTINUE_SEARCH;
++
++    LOGE("guest fault: build=%s operation=%llu address=%08llX native=%p thread=%lu",
++         BLACK_COMMIT, static_cast<unsigned long long>(record->ExceptionInformation[0]),
++         static_cast<unsigned long long>(address - start), record->ExceptionAddress, GetCurrentThreadId());
++    kernel::LogGuestStack(*thread->ctx, 128);
++    logx::Flush();
++
++    auto dir = app::ExeDir() / "CrashDumps";
++    CreateDirectoryW(dir.c_str(), nullptr);
++    SYSTEMTIME now;
++    GetLocalTime(&now);
++    wchar_t name[128];
++    swprintf(name, 128, L"Black.guest-fault.%04u%02u%02u-%02u%02u%02u-%lu.dmp",
++             now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, GetCurrentProcessId());
++    HANDLE file = CreateFileW((dir / name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file != INVALID_HANDLE_VALUE) {
++        MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), exception, FALSE};
++        BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file,
++                                   MINIDUMP_TYPE(MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
++                                                 MiniDumpWithIndirectlyReferencedMemory),
++                                   &info, nullptr, nullptr);
++        DWORD error = ok ? 0 : GetLastError();
++        CloseHandle(file);
++        LOGR("guest fault: diagnostic dump %s (error=%lu)", ok ? "saved" : "failed", error);
++    } else LOGR("guest fault: cannot create diagnostic dump (error=%lu)", GetLastError());
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++}  // namespace
++
++void Init() {
++    LOGR("BLACK build %s, compiled %s %s", BLACK_COMMIT, __DATE__, __TIME__);
++    if (!AddVectoredExceptionHandler(1, GuestFault))
++        LOGR("guest fault: observer unavailable (error=%lu)", GetLastError());
++}
++}  // namespace game::diagnostics
+diff --git a/src/game/diagnostics.h b/src/game/diagnostics.h
+new file mode 100644
+index 0000000..4ed2378
+--- /dev/null
++++ b/src/game/diagnostics.h
+@@ -0,0 +1,5 @@
++#pragma once
++
++namespace game::diagnostics {
++void Init();
++}
+diff --git a/src/game/exit_menu.cpp b/src/game/exit_menu.cpp
+index 805770c..72a5de2 100644
+--- a/src/game/exit_menu.cpp
++++ b/src/game/exit_menu.cpp
+@@ -73,6 +73,7 @@ constexpr size_t kSounds = std::size(kSoundClips);
+ const TitleMenu* g_return = &kTitleMenus[1];  // the title menu No goes back to
+ bool g_confirm_ready = false;  // the page's No and back lead there
+ bool g_quitting = false;
++bool g_asked = false;  // this ConfirmWarning is our quit question: the game asks its own with the page too
+ bool g_reported = false;  // a failure is logged once
+ uint32_t g_title_sounds[kSounds] = {};  // the characters of the title menu's sound clips
+ uint32_t g_held_audio = 0;  // FEAudio, held loaded while ConfirmWarning plays its clips
+@@ -239,14 +240,14 @@ bool PointBack(X86Context& ctx, uint32_t root) {
+ void UpdateConfirm(X86Context& ctx, uint32_t ui, uint32_t root) {
+     if (!g_confirm_ready) g_confirm_ready = PointBack(ctx, root);
+     if (R32(ui + kPageLeaving) || R32(ui + kPageAsked) == 1 || !InputTaken(ui)) return;
+-    if (R32(ui + kMenuInput) != kInputConfirm) return;
++    if (R32(ui + kMenuInput) != kInputConfirm || !g_asked) return;  // another question's Yes is the game's
+     uint32_t yes = Member(ctx, root, "yesButton");
+     uint32_t focus = Member(ctx, Member(ctx, root, "MyMenu"), "mFocusButton");
+     if (!yes || focus != yes) return;
+     W32(ui + kMenuInput, 0);
+     if (g_quitting) return;
+     g_quitting = true;
+-    LOGI("quit: closing the window");
++    LOGR("quit: closing the window (the title menu's QUIT)");
+     PostMessageW(static_cast<HWND>(app::Window()), WM_CLOSE, 0, 0);
+ }
+ 
+@@ -257,6 +258,9 @@ void Tick(X86Context& ctx, uint32_t ui) {
+     if (R32(flash::kPlayerReady) != 1 || !R32(flash::kPlayer) || R32(ui + kPageReady) != kPageRunning) return;
+     uint32_t root = flash::Level(flash::kMenuLevel);
+     if (!root) return;
++    // the question is ours when a title menu asks for the page (its QUIT, or back), and stays so while it is shown
++    if (FindTitleMenu(page)) g_asked = HasPrefix(static_cast<const char*>(HostPtr(ui + kTargetPage)), kConfirmPage);
++    else if (!HasPrefix(page, kConfirmPage)) g_asked = false;
+     if (const TitleMenu* title = FindTitleMenu(page)) {
+         ReleaseTitleAudio();
+         UpdateButton(ctx, ui, *title, root);
 diff --git a/src/game/fps_counter.cpp b/src/game/fps_counter.cpp
-index 0b0a5db..28fbf38 100644
+index 0b0a5db..4dc999e 100644
 --- a/src/game/fps_counter.cpp
 +++ b/src/game/fps_counter.cpp
-@@ -8,6 +8,7 @@
+@@ -4,10 +4,20 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <optional>
++#include <string>
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
+ 
  #include "app/app.h"
  #include "common/aspect.h"
  #include "common/options.h"
@@ -325,20 +842,32 @@ index 0b0a5db..28fbf38 100644
  #include "game/flash.h"
  #include "game/layout.h"
  #include "xdk/hle.h"
-@@ -68,16 +69,17 @@ float TextWidth(uint32_t font, const char* text) {
+@@ -63,21 +73,25 @@ uint32_t Glyph(uint32_t font, uint16_t code) {
+ 
+ // in lines of a 480 frame, at kSize
+ float TextWidth(uint32_t font, const char* text) {
++    wchar_t wide[64]{};
++    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, 64);
+     float advance = 0;
+-    for (const char* c = text; *c; c++) advance += G<float>(Glyph(font, uint8_t(*c)) + kGlyphAdvance);
++    for (int i = 0; i + 1 < count; i++) advance += G<float>(Glyph(font, uint16_t(wide[i])) + kGlyphAdvance);
      return advance * G<float>(font + kFontScale) * kSize;
  }
  
 -// x and y in lines of a 480 frame from the output's top left
 -void DrawText(X86Context& ctx, uint32_t font, const View& view, const char* text, float x, float y, bool shadow) {
+-    static const uint32_t block = mem::AllocSystem(0x60);
 +// x and y in lines of a 480 frame from the output's top left; rgb null is the HUD's grey
 +void DrawText(X86Context& ctx, uint32_t font, const View& view, const char* text, float x, float y, bool shadow,
 +              const float* rgb = nullptr) {
-     static const uint32_t block = mem::AllocSystem(0x60);
++    static const uint32_t block = mem::AllocSystem(0xA0);
      uint32_t colour = block;
      uint32_t chars = block + 0x10;
-     int n = std::min(int(std::strlen(text)), 31);
-     for (int i = 0; i <= n; i++) G<uint16_t>(chars + i * 2) = i < n ? uint8_t(text[i]) : 0;
+-    int n = std::min(int(std::strlen(text)), 31);
+-    for (int i = 0; i <= n; i++) G<uint16_t>(chars + i * 2) = i < n ? uint8_t(text[i]) : 0;
++    wchar_t wide[64]{};
++    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, 64);
++    std::memcpy(HostPtr(chars), wide, sizeof wide);
      for (int s = shadow; s >= 0; s--) {
 -        float rgb = s ? 0.0f : kGrey;  // the shadow black
 -        for (int i = 0; i < 4; i++) G<float>(colour + i * 4) = i == 3 ? 1.0f : rgb;
@@ -347,14 +876,16 @@ index 0b0a5db..28fbf38 100644
          float px = (x + s) * view.unit * view.narrow;
          float py = (y + s) * view.unit;
          CallGuest(ctx, kText, {font, chars, std::bit_cast<uint32_t>(px), std::bit_cast<uint32_t>(py),
-@@ -119,6 +121,26 @@ std::optional<float> LegendSlide(const TitlePage& page) {
+@@ -119,6 +133,31 @@ std::optional<float> LegendSlide(const TitlePage& page) {
      return G<float>(prompt + kClipX) - page.legend_rest_x;
  }
  
 +// a marker's text centred on its point; the font is drawn narrowed here, which TextWidth already has
 +void DrawMarker(X86Context& ctx, uint32_t font, const View& view, const coop::Marker& m, const float* rgb) {
 +    float width = TextWidth(font, m.text) / view.narrow;
-+    DrawText(ctx, font, view, m.text, m.x - width / 2, m.y - kSize / 2, true, rgb);
++    float right = std::max(kMargin, game::Aspect() * 480.0f - width - kMargin);
++    float left = std::clamp(m.x - width / 2, kMargin, right);
++    DrawText(ctx, font, view, m.text, left, m.y - kSize / 2, true, rgb);
 +}
 +
 +// the co-op's status under the frame rate, the partner where it stands, the probe's readout
@@ -368,13 +899,16 @@ index 0b0a5db..28fbf38 100644
 +    if (game::g_hide_hud) return;
 +    coop::Marker m;
 +    if (coop::ProbeMarker(m)) DrawMarker(ctx, font, view, m, kProbe);
-+    if (coop::RemoteMarker(m)) DrawMarker(ctx, font, view, m, kPartner);
++    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
++        coop::PartnerScope scope(player);
++        if (coop::RemoteMarker(m)) DrawMarker(ctx, font, view, m, kPartner);
++    }
 +}
 +
  }  // namespace
  
  // D3DVIEWPORT8
-@@ -135,7 +157,8 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
+@@ -135,7 +174,8 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
      const TitlePage* title = CurrentTitlePage();
      std::optional<float> slide = title ? LegendSlide(*title) : std::nullopt;
      bool watermark = slide.has_value();
@@ -384,7 +918,7 @@ index 0b0a5db..28fbf38 100644
      View view{h / 480, w / h / game::Aspect()};
      float& width = G<float>(font + kFontScale);
      float game_width = width;
-@@ -149,6 +172,7 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
+@@ -149,6 +189,7 @@ void DrawOverlay(X86Context& ctx, uint8_t*) {
          DrawText(ctx, font, view, text, kMargin, kMargin, true);
      }
      if (watermark) DrawText(ctx, font, view, kWatermark, watermark_x, kWatermarkTop, false);
@@ -421,3 +955,108 @@ index c749e20..ad98326 100644
      uint32_t physics = R32(kPhysics);
      uint32_t solver = physics ? R32(physics) : 0;
      uint32_t world = solver ? R32(solver + kSolverWorld) : 0;
+diff --git a/src/game/log_keep.cpp b/src/game/log_keep.cpp
+new file mode 100644
+index 0000000..1866232
+--- /dev/null
++++ b/src/game/log_keep.cpp
+@@ -0,0 +1,38 @@
++// The last session's log kept: the release log (logs\black.log, black-N.log for another instance) is opened anew at
++// each start, and a session that ended on its own (the title leaving through HalReturnToFirmware, which exits with
++// no crash dump) would lose the only trace of why as soon as the game is opened again. Before main, while no log is
++// open, each one goes to <name>.prev.log. A log another running copy holds stays where it is.
++#include <filesystem>
++#include <string>
++#include <system_error>
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++
++namespace {
++
++namespace fs = std::filesystem;
++
++struct KeepLastLog {
++    KeepLastLog() {
++        wchar_t exe[MAX_PATH];
++        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
++        if (!n || n >= MAX_PATH) return;
++        std::error_code ec;
++        fs::path dir = fs::path(exe).parent_path() / "logs";
++        if (!fs::is_directory(dir, ec)) return;
++        for (const auto& e : fs::directory_iterator(dir, ec)) {
++            const fs::path& p = e.path();
++            std::wstring stem = p.stem().wstring();
++            if (p.extension() != L".log" || stem.rfind(L"black", 0) != 0 || stem.find(L".prev") != std::wstring::npos)
++                continue;
++            fs::path to = dir / (stem + L".prev.log");
++            // replaced only if this one can go: a log in use by another copy fails the move and both stay
++            MoveFileExW(p.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING);
++        }
++    }
++} g_keep_last_log;
++
++}  // namespace
+diff --git a/src/game/sprint.cpp b/src/game/sprint.cpp
+new file mode 100644
+index 0000000..7c17946
+--- /dev/null
++++ b/src/game/sprint.cpp
+@@ -0,0 +1,55 @@
++// Sprint: the sprint key (Shift) held while moving forward on the keyboard, the player goes sprint_speed percent of
++// its run. The player's body is +0xA0 (the last row of its matrix), which the frame's update takes as it is at its
++// start; there, before it, the step the player made in the last frame is lengthened, so collisions stop it as they
++// stop the run (a step against a wall is no step).
++#include <cstdint>
++
++#include "common/mouse_keyboard.h"
++#include "common/options.h"
++#include "game/layout.h"
++#include "kernel/kernel.h"
++
++using namespace kernel;
++
++namespace {
++
++constexpr uint32_t kPlayerFeet = 0xA0;
++constexpr uint32_t kPlayerCrouch = 0x3A1;
++constexpr uint32_t kPlayerState = 0x384;  // 0 alive
++constexpr float kStepMax = 0.5f;          // longer in a frame: a teleport or a respawn, not a step
++
++bool g_forced = false;  // the test channel's "sprint 1"
++
++}  // namespace
++
++namespace sprint {
++
++void Force(bool on) { g_forced = on; }
++
++
++void Tick() {
++    static float last[3];
++    static bool have = false;
++    uint32_t world = R32(layout::kWorld);
++    if (!world) {
++        have = false;
++        return;
++    }
++    uint32_t p = world + layout::kWorldPlayer;
++    float& x = G<float>(p + kPlayerFeet);
++    float& z = G<float>(p + kPlayerFeet + 8);
++    float extra = float(game::Opt().sprint_speed) / 100.0f - 1.0f;
++    if (have && extra > 0 && (input::Sprinting() || g_forced) && R32(p + kPlayerState) == 0 &&
++        !G<uint8_t>(p + kPlayerCrouch)) {
++        float dx = x - last[0], dz = z - last[2];
++        float d2 = dx * dx + dz * dz;
++        if (d2 > 1e-8f && d2 < kStepMax * kStepMax) {
++            x += dx * extra;
++            z += dz * extra;
++        }
++    }
++    last[0] = x, last[2] = z;
++    have = true;
++}
++
++}  // namespace sprint

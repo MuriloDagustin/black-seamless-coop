@@ -3,7 +3,9 @@
 // enemy is named by its spawner's 64 bit record name (unique in a level) and the count of that spawner's spawns.
 // Events go over an acknowledged channel: each frame until acknowledged, in order.
 // All of it runs on the game thread.
+#include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "kernel/kernel.h"
 
@@ -26,6 +28,8 @@ void Acked(uint32_t seq);
 void Incoming(const uint8_t* p, int bytes, int count, uint64_t now);
 uint32_t Taken();
 void Reset();  // a new partner session: both directions start again from 1
+std::vector<uint8_t> MissionSnapshot(); // objective rows, counters and collected IDs for a late join
+bool RestoreMissionSnapshot(const uint8_t* data, size_t bytes);
 
 void Tick(X86Context& ctx);  // the partner's events applied, once a frame of play
 uint32_t LiveCharacter(uint64_t name);  // this copy's live character of that spawner, 0 none
@@ -34,7 +38,8 @@ void SendMelee(uint64_t name, uint32_t dir);  // joining copy: its player's mele
 void FlowTick(X86Context& ctx);  // each frame: a unit advance waiting for the partner
 bool WaitingForPartner();        // this copy's unit advance waits for the partner
 uint8_t WaitingUnit();           // the unit this copy's waiting advance is to, 0 none
-void AskRescue();                // "get me out of here": this copy's units brought to the partner's, then the player
+void AskRescue();
+void AskRescueTo(int player);  // the rescue by that partner                // "get me out of here": this copy's units brought to the partner's, then the player
 void LevelReset();           // the level (re)loads: no enemy is known any more
 // stage 2: the one shot triggers fire for the partner's body too, after the logic tick 0x1E7FF0 of the manager
 void PartnerTriggers(X86Context& ctx, uint32_t mgr);

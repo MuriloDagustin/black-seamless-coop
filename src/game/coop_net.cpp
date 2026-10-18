@@ -13,6 +13,7 @@
 #include "app/app.h"
 #include "core/log.h"
 #include "game/coop_net.h"
+#include "game/coop_online.h"
 
 namespace coop::net {
 
@@ -58,6 +59,7 @@ bool Open(uint16_t port) {
 }
 
 void Close() {
+    online::Stop();
     if (g_socket != INVALID_SOCKET) ::closesocket(g_socket);
     g_socket = INVALID_SOCKET;
     if (g_started) WSACleanup();
@@ -85,6 +87,7 @@ uint32_t Resolve(const std::string& host) {
 }
 
 bool Send(const Peer& to, const void* p, int n) {
+    if (to.online) return online::Send(to.online, p, n);
     if (g_socket == INVALID_SOCKET) return false;
     sockaddr_in a{};
     a.sin_family = AF_INET;
@@ -94,6 +97,7 @@ bool Send(const Peer& to, const void* p, int n) {
 }
 
 int Receive(Peer& from, void* p, int n) {
+    if (online::Active()) return online::Receive(from, p, n);
     if (g_socket == INVALID_SOCKET) return -1;
     sockaddr_in a{};
     int len = sizeof a;
@@ -104,6 +108,7 @@ int Receive(Peer& from, void* p, int n) {
 }
 
 std::string Text(const Peer& p) {
+    if (p.online) return online::PeerName(p.online);
     in_addr a{};
     a.s_addr = p.addr;
     char ip[INET_ADDRSTRLEN] = {};

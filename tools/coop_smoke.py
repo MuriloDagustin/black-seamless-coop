@@ -127,19 +127,31 @@ def main():
     def clips():
         return copies[0].command(f"peek {anim + 0x5C:X} 10")
 
+    def moving_clip(speed, start_z):
+        # Crossing the courtyard can open a hint on either copy. A paused host
+        # cannot advance its partner's animation, even while that partner moves.
+        copies[1].command(f"stick 0 {speed} 0 0 3000")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            states = [c.command("state") for c in copies]
+            if any(" play=0 " in s for s in states):
+                for c, s in zip(copies, states):
+                    if " play=0 " in s:
+                        c.dismiss_hint()
+                copies[1].command(f"stick 0 {speed} 0 0 3000")
+            else:
+                z = float(re.search(r"feet=([^ ]+)", states[1])[1].split(",")[2])
+                if z > start_z + 0.5 and clips() != standing:
+                    return
+            time.sleep(0.1)
+        raise AssertionError(("No locomotion while both worlds ran", states, standing, clips()))
+
     standing = clips()
-    copies[1].command("stick 0 0.5 0 0 1000")
-    time.sleep(0.7)
-    walking = clips()
-    assert walking != standing, (standing, walking)
+    moving_clip(0.5, 40)
     copies[1].command("release")
     time.sleep(1)
-    copies[1].command("stick 0 1 0 0 2500")
-    time.sleep(1)
     feet = re.search(r"feet=([^ ]+)", copies[1].command("state"))[1]
-    assert float(feet.split(",")[2]) > 41, "Movement test was blocked"
-    moving = clips()
-    assert moving != standing, (standing, moving)
+    moving_clip(1, float(feet.split(",")[2]))
     copies[1].command("release")
     # Entering the courtyard can open a tutorial hint and freeze both worlds.
     # Resume simulation before asserting that an animation returns to idle.

@@ -1,75 +1,119 @@
 # Black Seamless Co-op
 
-Networked two-player co-op for **Black** (Criterion, 2006), built as a mod for the
-unofficial native PC port [TGP482/BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp),
-a static recompilation of the original Xbox game made with
-[XboxXBE-Recomp](https://github.com/TGP482/XboxXBE-Recomp).
+Play the campaign of **Black** (Criterion, 2006) together with up to **8 players**, on PC.
 
-This repository holds **only the co-op code**: new source files and a small patch. It has no game data
-and no code from the port or the recompiler. `setup.bat` fetches the port and the SDK at the exact
-versions this mod was made with, and puts the mod on top. You need your own copy of the game.
+This is a mod for [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp), an unofficial native PC
+port of the original Xbox game (a static recompilation made with
+[XboxXBE-Recomp](https://github.com/TGP482/XboxXBE-Recomp)). Black never had multiplayer: everything here
+is built on top of the game's own code, so expect rough edges.
 
-> Work in progress. Black never had multiplayer; everything here is reverse engineered from the game's
-> recompiled code, so expect rough edges.
+> **You need your own copy of Black (Xbox, USA release).** This repository contains only the co-op code.
+> It has no game files and no code from the port or the recompiler.
+
+---
+
+## Quick start
+
+1. **Install the tools** (once): Windows 10/11 64-bit, [git](https://git-scm.com/download/win),
+   [Python 3](https://www.python.org) and Visual Studio 2022 or later with *Desktop development with C++*,
+   *C++ Clang tools* and *C++ CMake tools*.
+2. **Download this repository** (green *Code* button → *Download ZIP*, or `git clone`).
+3. **Run the setup** with your disc image of Black:
+   ```
+   setup.bat black-recomp "C:\path\to\Black.iso"
+   ```
+   It downloads the port and the recompiler at the versions this mod was tested with, applies the mod and
+   extracts your game into `black-recomp\assets`.
+4. **Build**: run `black-recomp\build.bat`. The first build recompiles the whole game and takes a while.
+5. **Play**: `black-recomp\out\build\release\BLACK.exe`.
+
+Every player needs **the same build**. The easiest way: one person builds it and shares the
+`out\build\release` folder (`BLACK.exe` and its DLLs, without the game). Each player puts their **own** copy
+of the game in an `assets` folder next to `BLACK.exe`: the `.iso` file or the extracted disc files.
+
+## Playing together
+
+Press **F10 → CO-OP** in the game:
+
+- **One player hosts.** Their game runs the enemies and the mission; everyone else follows it.
+- **The others join**: pick the host from the list (same network) or type the host's IP address.
+- Joining players are taken to the host's mission, difficulty and progress automatically, even halfway
+  through a level.
+
+Over the internet the host must be reachable on **UDP port 45410**: a port forward on the host's router
+(with `BLACK.exe` allowed through the Windows firewall), or a virtual LAN such as Tailscale or ZeroTier.
+
+**Online rooms by code** (no port forwarding) work through Epic Online Services, but only in a build made
+with your own free Epic developer account and the EOS SDK. See [docs/online.md](docs/online.md).
+
+### Controls
+
+| | Keyboard / mouse | Controller |
+|---|---|---|
+| F10 menu: co-op, settings, key bindings | **F10** | |
+| Sprint | **Shift** while moving forward | |
+| Get me out of here: go to a teammate | **F8** | **L3 + R3** held for a second |
+| While down: watch the next teammate | **click**, **Space** or **→** (**←** the previous one) | **A** or the D-pad |
+
+The sprint speed is set next to the key bindings in the F10 menu (**SPRINT SPEED**, 100% to 250%,
+140% by default).
+
+### Co-op rules
+
+- **Dying is not the end.** A player who dies is *down*: the mission goes on and they watch a living
+  teammate. They come back when the team reaches the next area or completes an objective.
+  The mission fails only when **everyone** is down.
+- **Areas load for everyone.** Whoever reaches the next area's door first waits there until the others
+  arrive. If you get lost or stuck, press **F8**.
+- **Shared progress.** Objectives, secondary pickups (blackmail, intel...), mission failed, continue,
+  restart and level complete count for everyone.
+- **Everyone's progress is saved.** After a mission each player's game shows its own save screens; a
+  joining player goes through them before following the host to the next mission. With no profile yet,
+  the game asks for a name there.
 
 ## What works
 
 | | |
 |---|---|
-| Connection | UDP, host and join, reconnects when either side restarts |
-| Partner marker | the partner's position drawn over the frame (`P2 12`, arrows at the edges) |
-| Partner's body | each copy shows the partner as a soldier walking where the partner walks and looking where it looks |
-| Partner bullets | the partner's shots are fired again on your copy through the game's own bullet code: impacts, decals, glass, destruction and damage to enemies, with a tracer, the partner's muzzle flash and a 3D gunshot. They never hit you or touch your ammo or HUD |
-| Enemies | the host runs them: on the joining copy each enemy is a puppet of the host's (position, animation, aim, fire, reloads, health and death). They see, hear and shoot the joining player's body, so the joining player is hit by them |
-| Enemy deaths | an enemy killed on one copy dies on the other, ragdoll and scripts included |
-| Props, grenades, rockets | crates, barrels and breakable scenery break on both copies; the partner's grenades and rockets fly and explode on yours |
-| Triggers | one-shot area triggers (enemy waves, scripted scenes) fire for either player's position |
-| Level flow | the game moves on to the next area only when both players have gone through; the one ahead waits at the next door (a LOADING screen) until the other comes. Mission failed and level complete count for both |
-| F10 CO-OP tab | host a server, see servers on the LAN, join by IP or host name, or leave, without restarting the game. The role, port and address are saved in `black.toml` |
-| Secondary objectives | blackmail, intel, recon and armament pickups count on both copies (each by its own script action, so two pickups at once do not count twice), and the picked item goes from the partner's map too |
-| Get me out of here | **F8**, or **L3 + R3** held for a second on a controller: you are put next to your partner, on the way it just walked |
-| Test channel | `--coop-control`: a local text channel that drives a copy without its window's focus (pad, aim, teleport, state), for automated two-copy tests |
+| Up to 8 players | a host-run session, a nickname over every teammate |
+| Teammates | each one is a soldier that walks, runs, crouches and aims as they do |
+| Shooting | teammates' bullets hit, break and kill on your screen too, with muzzle flash, tracer and gunshot |
+| Enemies | run by the host; they see, hear and shoot every player |
+| World | deaths, crates, barrels, breakable scenery, grenades, rockets and area triggers are the same for everyone |
+| Level flow | areas, objectives, mission failed / continue / restart / complete together |
+| Lives | down, spectate a teammate, revive at the next checkpoint |
+| Pause | a teammate in the pause menu stays visible, marked PAUSED |
 
-Not yet: retrying a failed mission together (each player picks Continue on its own copy),
-cinematics in sync, vehicles.
+Not yet: cutscenes in sync, vehicles.
 
-## Setup
+## Problems?
 
-Requirements: Windows 10/11 64-bit, [git](https://git-scm.com/download/win),
-Visual Studio 2022 or later with *Desktop development with C++*, *C++ Clang tools* and *C++ CMake tools*,
-and Python 3 if you set up from a disc image.
+- **Can't connect:** everyone must run the same build. Check the host's port forward and firewall
+  (UDP 45410), or use a virtual LAN.
+- **The game closed:** send `logs\black.log` (next to `BLACK.exe`) and the newest file in `CrashDumps`,
+  if there is one. The log of the previous session is kept as `logs\black.prev.log`.
+- **Stuck, or the next area didn't load:** press **F8** to go to a teammate.
 
-```
-setup.bat [folder] [Black.iso]
-```
+---
 
-1. `setup.bat` clones the port into `black-recomp` (or the folder you name), the SDK into its `sdk`
-   folder, applies `patches/upstream.patch` and copies `src/game/coop*`.
-2. Give it your disc image (USA release) and it extracts it into the port's `assets` folder with
-   `tools/xiso_extract.py`; or put the extracted files there yourself (`default.xbe`, `GlobData.bin`
-   and the `chars`, `data`, `export`, `language`, `levels`, `sound`, `videos` folders).
-3. Run the port's `build.bat`. The first build recompiles the game and takes a while.
-   The game is `out\build\release\BLACK.exe`.
+## For developers
 
-Both players need this same build.
+### What the setup does
 
-## Playing
+`setup.bat [folder] [Black.iso]` clones the port into `black-recomp` (or the folder you name) and the
+recompiler SDK into its `sdk` folder at pinned commits, applies `patches/upstream.patch` (the mod's changes
+to the port's own files) and copies `src/game/coop*` (the co-op itself). With a disc image it extracts the
+game with `tools/xiso_extract.py`; otherwise put `default.xbe`, `GlobData.bin` and the `chars`, `data`,
+`export`, `language`, `levels`, `sound` and `videos` folders in the port's `assets` folder yourself.
 
-The easiest way: **F10 → CO-OP**. One player hosts; the other picks the host from the list (LAN) or types its
-address. Connect before loading the mission, then load the same mission on both copies. Over the internet, the
-host must be reachable on UDP 45410 (a port forward on its router, or a virtual LAN such as Tailscale).
-
-From the command line:
+### Command line
 
 ```
-BLACK.exe --coop host                      the host, UDP 45410
-BLACK.exe --coop join --join 192.168.0.10  the partner, the host's address
+BLACK.exe --coop host                      host on UDP 45410
+BLACK.exe --coop join --join 192.168.0.10  join that host
 ```
 
-Both load the same level, ideally from the same checkpoint. Over the internet the host forwards
-UDP 45410 and allows BLACK.exe through the Windows firewall.
-
-On one PC, for testing, set `display_mode = 'windowed'` in `black.toml` beside the exe and run:
+Two copies on one PC, for testing (`display_mode = 'windowed'` in `black.toml`):
 
 ```
 BLACK.exe --instance 1 --coop host
@@ -78,58 +122,59 @@ BLACK.exe --instance 2 --coop join --join 127.0.0.1 --mute
 
 | Option | |
 |---|---|
-| `--coop host` / `--coop join` | role, for this copy only |
-| `--join <address>` | the host to join (or `join_ip` in `black.toml`) |
+| `--coop host` / `--coop join` | role, for this copy only (`coop = 1` or `2` in `black.toml` for a default) |
+| `--join <address>` | the host to join (or `join_ip`) |
 | `--coop-port <n>` | the host's UDP port (or `coop_port`), 45410 by default |
-| `--coop-world <n>` | world sync: 6 everything (default), 5 no level flow, 4 no partner's body, 3 no host-run enemies, 2 deaths and triggers, 1 deaths only, 0 off |
-| `--instance <n>` | a second copy on one PC: its own saves (`hddN`) and log |
+| `--coop-world <n>` | world sync level: 6 everything (default) down to 0 off |
+| `--instance <n>` | another copy on one PC, with its own saves (`hddN`) and log |
 | `--mute` | no sound |
-| `--coop-probe` | on-screen readout: position, shot and world event counters |
-| `--coop-echo` | alone: your own position and shots come back 3 s later, to see the partner side work |
-| `--coop-control [port]` | test channel on 127.0.0.1 (45500 + instance): this copy plays the pad it is sent and reads no mouse, keyboard or controller |
+| `--coop-probe` / `--coop-echo` | an on-screen readout / your own state echoed back as a fake partner |
+| `--coop-control [port]` | a local test channel (127.0.0.1, 45500 + instance) that drives the copy |
 
-### Test channel
+The test channel takes one text command per UDP datagram (`state`, `page`, `pad`, `stick`, `teleport`,
+`stand`, `rescue`, `die`, `revive`, `watch`, `sprint`, `flow fail|complete`, `mission`, `peek`...); the
+scripts in `tools/` use it for automated multi-copy tests.
 
-One command per UDP datagram, one reply each: `ping`, `state`, `npcs`, `page`, `triggers [all]`,
-`pad <a,b,x,y,lt,rt,up,down,left,right,start,back,...> [ms]`, `hold <names>`, `stick <lx> <ly> <rx> <ry> [ms]`,
-`release`, `yaw`/`pitch`/`turn <deg>`, `aim <x> <y> <z>` / `aim nearest` / `aim off`,
-`teleport <x> <y> <z>` / `teleport partner`, `rescue` (as F8), `stand <trigger> [frames]`,
-`triggers units`, `props [n]`, `rocket`, `level <n>` (the next load), `flow fail|complete`,
-`peek`/`peekf <addr> [n]`, `pokef <addr> <floats>`, `log <text>`. Addresses take `@player+hex` and `@world+hex`.
+### How it works
 
-`black.toml` also takes `coop = 1` (host) or `2` (join) to make a role the default.
+The port lets host code replace any recompiled function. The mod wraps, among others:
 
-## How it works
-
-The port lets host code replace any recompiled function at link time. The mod wraps:
-
-- the frame function `0x20F6A0`: packets in before the frame, the player's state out after it;
-- the player's bullet spawn `0x1DB7B0` and trigger pull `0x1DBD50`: each pellet goes to the partner,
-  whose copy spawns it again with a weapon of the same type owned by its own player, in a bullet pool
-  of its own;
-- the character spawn `0x1DF440` and the death paths `0x205C60`, `0x1DA240`, `0x1DA1A0`: an enemy is
-  named by its spawner's 64-bit record name, which is the same on both copies; the partner's deaths are
-  played with the game's own death function;
-- the logic tick `0x1E7FF0`: one-shot triggers are tested again at the partner's position;
-- the AI think `0x1E5F70` and the characters' update `0x1CCBB0`: on the joining copy the host's enemies are
-  driven from the host's snapshots (30 a second) instead of their own AI;
-- the ally spawn `0x1AF880`: the partner's body is an ally made the way the game makes a squad mate, and the
-  enemies' perception `0x1AD440` sees it in an empty squad slot;
-- the unit advance `0x1B73B0`, the next unit's activation `0x1C7620` and the in-level state's requests
-  `0x1F45C0`/`0x1F45B0`/`0x1F4590`: the level flow for both players.
+- the frame function `0x20F6A0`: packets in before the frame, each player's state out after it;
+- the player's bullets `0x1DB7B0`/`0x1DBD50`: fired again on every copy with the game's own bullet code;
+- character spawns and deaths (`0x1DF440`, `0x205C60`, `0x1DA240`, `0x1DA1A0`): enemies are named by their
+  spawner's record, the same on every copy;
+- the AI think `0x1E5F70` and the characters' update `0x1CCBB0`: on joining copies the host's enemies are
+  puppets of its snapshots;
+- the ally spawn `0x1AF880` and the enemies' perception `0x1AD440`: teammates' bodies are squad allies the
+  enemies see;
+- the unit advance `0x1B73B0`, the activation `0x1C7620` and the in-level requests `0x1F45C0`/`0x1F45B0`:
+  the level flow;
+- the player's death (`0x1D54C0`, `0x1BD360`, `0x1C6410`) and the scene camera `0x2B830`: the lives and
+  the spectator camera.
 
 ## Português
 
-Co-op em rede para dois jogadores no **Black**, feito como mod da port para PC
-[BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp). Este repositório tem só o código do co-op;
-o `setup.bat` baixa a port e o SDK nas versões testadas e aplica o mod. Você precisa da sua própria cópia
-do jogo. Funciona hoje: conexão, corpo e marcador do parceiro, balas do parceiro com impacto, dano, clarão
-e estampido, inimigos controlados pelo host (que enxergam e atiram no parceiro), mortes, objetos
-destrutíveis, granadas e foguetes sincronizados, gatilhos de área disparados por qualquer um dos dois,
-troca de área esperando os dois jogadores, missão falhada e fim de fase valendo para ambos, e
-"me tira daqui": **F8** ou **L3 + R3** segurados por um segundo te levam para perto do parceiro.
+Co-op para até **8 jogadores** na campanha do **Black**, como mod da port para PC
+[BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp). **Você precisa da sua própria cópia do jogo**
+(Xbox, versão USA). Este repositório tem só o código do co-op.
+
+**Instalar:** instale git, Python 3 e o Visual Studio (com C++, Clang e CMake), rode
+`setup.bat black-recomp "C:\caminho\Black.iso"` e depois `black-recomp\build.bat`. O jogo fica em
+`black-recomp\out\build\release\BLACK.exe`. Todos precisam da mesma build: uma pessoa compila e passa a
+pasta `out\build\release` (sem o jogo) para os outros, e cada um coloca a própria cópia do jogo (a `.iso`
+ou os arquivos do disco) na pasta `assets` ao lado do `BLACK.exe`.
+
+**Jogar:** **F10 → CO-OP**. Um abre como host, os outros entram pela lista (mesma rede) ou pelo IP do host.
+Pela internet o host precisa liberar a porta **UDP 45410** (ou usar Tailscale/ZeroTier). Salas online por
+código funcionam via Epic Online Services, só numa build feita com a sua conta de desenvolvedor da Epic
+(veja [docs/online.md](docs/online.md)).
+
+**Regras:** quem morre fica caído assistindo um parceiro e volta quando o time chega na próxima área ou
+completa um objetivo; a missão só falha se todos caírem. **Shift** corre, **F8** te leva até um parceiro,
+e caído você troca quem assiste com clique, espaço ou as setas. Objetivos, continuar, reiniciar e o
+progresso salvo valem para todos.
 
 ## License
 
-The code in this repository is MIT licensed (see `LICENSE`). It applies to this repository's files only:
+The code in this repository is MIT licensed (see `LICENSE`). It covers this repository's files only:
 the port, the recompiler and the game belong to their authors.

@@ -10,6 +10,7 @@
 // for that call, so they turn on it and shoot; the joining copy's puppets of them then shoot from the host's aim,
 // at the player the body stands for.
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -50,6 +51,7 @@ constexpr uint32_t kControlFire = 0x41;
 constexpr uint32_t kControlMove = 0x60;     // the displacement's direction, times +0x20 a second
 constexpr uint32_t kControlMoveDir = 0x70;  // for the locomotion's direction
 constexpr uint32_t kControlRate = 0x84;
+constexpr uint32_t kControlLocomotion = 0x4A; // selects gait instead of S_MVI in 0x17FDF0
 constexpr uint32_t kWeaponAim = 0x10;
 constexpr uint32_t kWeaponState = 0xD8;   // 4 reloading, 0x1B..0x1D a melee swing
 constexpr uint32_t kWeaponBarrel = 0xF4;  // its +0x18 the rounds left in the clip (int16)
@@ -115,19 +117,34 @@ constexpr uint32_t kAi = 0x2D1988;
 constexpr uint32_t kAiCounter = 0xFA4;
 constexpr uint32_t kAiFreeControl = 0x22CDC;
 constexpr uint32_t kAiSquad = 0x22974;  // four characters, the player among them
+constexpr uint32_t kAiBehaviourPool = 0x22C48 + 0x7C; // pointers, used bytes, count; distinct from controllers/living list
 constexpr uint32_t kPoolTypes = 0x7A20;  // the character types of 0x40, +0 their model when loaded
 constexpr uint32_t kBodyName = 0xC0FFEE00, kBodyNameHi = 0x00C00B0D;
 constexpr uint32_t kBodyTypes[] = {0x1E, 0x1D, 0x1F, 0x25};  // the squad mates, a soldier: the first loaded
 constexpr uint64_t kBodyRetryMs = 2000;
 constexpr uint64_t kBodyGoneMs = 3000;  // the partner gone from this level that long (not paused in it): let go
 constexpr float kBodyRun = 6.5f;
-uint32_t g_body = 0;
-uint32_t g_body_src = 0, g_body_sub = 0;
-uint64_t g_body_tried = 0, g_body_seen = 0;
-float g_body_prev[3];
-uint64_t g_body_prev_at = 0;
-float g_body_dir[3] = {0, 0, 1};
-float g_body_rate = 0;
+struct BodyState {
+    uint32_t character = 0, source = 0, sub = 0;
+    uint64_t tried = 0, seen = 0;
+    float direction[3] = {0, 0, 1}, rate = 0;
+};
+std::array<BodyState, coop::kMaxPlayers> g_body_states;
+BodyState& CurrentBody() { return g_body_states[coop::CurrentPartner()]; }
+#define g_body (CurrentBody().character)
+#define g_body_src (CurrentBody().source)
+#define g_body_sub (CurrentBody().sub)
+#define g_body_tried (CurrentBody().tried)
+#define g_body_seen (CurrentBody().seen)
+#define g_body_dir (CurrentBody().direction)
+#define g_body_rate (CurrentBody().rate)
+int BodyIndex(uint32_t character) {
+    if (!character) return -1;
+    for (int i = 0; i < coop::kMaxPlayers; i++)
+        if (g_body_states[i].character == character && R32(character + kCharName) == kBodyName + uint32_t(i) &&
+            R32(character + kCharName + 4) == kBodyNameHi) return i;
+    return -1;
+}
 std::unordered_map<uint64_t, Puppet> g_state;  // the host's, by spawner name
 std::unordered_map<uint64_t, uint64_t> g_absent;  // this copy's enemies the host has not, since
 std::unordered_map<uint64_t, uint64_t> g_died;    // puppets died here, when: the host's older states still have them
@@ -162,6 +179,7 @@ void Living(F f) {
 
 // the host's latest is of now: recent, of this level, the host in play in it
 bool Fresh(uint64_t now) {
+    coop::PartnerScope host(0);
     uint32_t world = R32(kWorld);
     float feet[3];
     return g_snap_at && now - g_snap_at < kFreshMs && world && g_snap_level == G<int8_t>(world + kWorldLevel) &&
@@ -178,25 +196,51 @@ bool HostOwned(uint32_t ch) {
            R32(ch + kCharControl) && NameOf(ch) && R32(R32(ch + kCharControl) + kControlChar) == ch;
 }
 
-bool BodyAlive() { return g_body && R32(g_body + kCharState) == 0 && NameOf(g_body) == Name(kBodyName, kBodyNameHi); }
+bool BodyAlive() { return g_body && R32(g_body + kCharState) == 0 && NameOf(g_body) == Name(kBodyName + uint32_t(coop::CurrentPartner()), kBodyNameHi); }
+
+// The AI characters' behaviour slots ([AI]+0x22C48+0x7C: pointers, used bytes, count; sixteen). Every AI character
+// takes one in 0x1899F0, which writes slot+0x20 even when its search found none (0x189A23-0x189A33: a write at 0x20,
+// the crash of a full pool). The game never has sixteen AI characters alive; the partners' bodies (one each, up to
+// seven) and the puppets make it reachable
+int BehaviourFree(uint32_t ai) {
+    uint32_t pool = ai + kAiBehaviourPool;
+    uint32_t pointers = R32(pool), used = R32(pool + 4), count = R32(pool + 8);
+    int n = 0;
+    for (uint32_t i = 0; pointers && used && i < std::min(count, 64u); i++)
+        if (!G<uint8_t>(used + i) && R32(pointers + i * 4)) n++;
+    return n;
+}
+
+bool BehaviourRoom(uint32_t ai) { return BehaviourFree(ai) > 0; }
+
+constexpr int kBodyHeadroom = 2;  // a body is made only with this many free: the level's own enemies keep theirs
 
 void MakeBody(X86Context& ctx, const float feet[3]) {
     uint32_t pool = R32(kPool), ai = R32(kAi);
-    if (!pool || !ai || !R32(ai + kAiFreeControl)) return;
+    if (!pool || !ai || !R32(ai + kAiFreeControl) || BehaviourFree(ai) < kBodyHeadroom) return;
     if (R32(pool + kAliveList + 4) == R32(pool + kAliveList + 8)) return;  // full: 0x1E6860 would cull one for it
+    uint32_t resources = R32(pool + 0x8528);
+    if (!resources || !R32(resources + 0x24)) return;
+    static constexpr hle::Map kFindType = hle::Make({hle::ecx, hle::stack, hle::stack});
     uint32_t type = 0;
-    for (uint32_t t : kBodyTypes)
-        if (R32(pool + kPoolTypes + t * 0x40)) {
+    for (uint32_t t : kBodyTypes) {
+        // The pool keeps nonzero pointers for types from previous missions,
+        // even after those models have been freed. Require the type in this
+        // mission's resource table, as the native type loader (0x1C4C30) does.
+        uint32_t definition = hle::Call(ctx, 0x17FC0, kFindType,
+                                       {R32(resources + 0x24), R32(0x288A10 + t * 8), R32(0x288A14 + t * 8)});
+        if (definition && R32(pool + kPoolTypes + t * 0x40)) {
             type = t;
             break;
         }
+    }
     if (!type) return;
     static constexpr hle::Map kRoomMap = hle::Make({hle::edx});
     if (!(hle::Call(ctx, kMakeRoom, kRoomMap, {pool}) & 0xFF)) return;  // a free entry of [0x2D45F4]+0x2960
     if (!g_body_src) g_body_src = mem::AllocSystem(0x40, 16), g_body_sub = mem::AllocSystem(0x40, 16);
     std::memset(HostPtr(g_body_src), 0, 0x40);
     std::memset(HostPtr(g_body_sub), 0, 0x40);
-    W32(g_body_src + 0x08, kBodyName);
+    W32(g_body_src + 0x08, kBodyName + uint32_t(coop::CurrentPartner()));
     W32(g_body_src + 0x0C, kBodyNameHi);
     float pos[4] = {feet[0], feet[1], feet[2], 1};
     std::memcpy(HostPtr(g_body_sub + 0x10), pos, 16);
@@ -246,16 +290,19 @@ void DriveBody(uint32_t ctl) {
     G<uint8_t>(g_body + kCharKinematic) = 1;
 }
 
-// once a logic tick: the body made while the partner is here, its walk measured, let go when the partner is not
+// Once a logic tick: use the sender's locomotion, holding it between packets.
 void BodyTick(X86Context& ctx) {
     uint64_t now = NowMs();
     float feet[3];
     bool here = coop::PartnerFeet(feet);
     if (g_body && !BodyAlive()) g_body = 0;
     if (coop::PartnerInLevel()) g_body_seen = now;  // paused in it too: its body stands where it was
+    if (coop::PartnerDown()) {  // dead: no body for the enemies to shoot until it is revived
+        if (g_body) ReleaseBody(ctx);
+        return;
+    }
     if (!here) {
         if (g_body && now - g_body_seen > kBodyGoneMs) ReleaseBody(ctx);
-        g_body_prev_at = 0;
         g_body_rate = 0;  // it stands
         return;
     }
@@ -264,15 +311,7 @@ void BodyTick(X86Context& ctx) {
         g_body_tried = now;
         MakeBody(ctx, feet);
     }
-    if (g_body_prev_at) {
-        float d[3] = {feet[0] - g_body_prev[0], 0, feet[2] - g_body_prev[2]};
-        float dist = std::sqrt(d[0] * d[0] + d[2] * d[2]);
-        float dt = float(now - g_body_prev_at) / 1000.0f;
-        if (dt > 0.001f) g_body_rate = g_body_rate * 0.7f + std::min(dist / dt, kBodyRun) * 0.3f;
-        if (dist > 0.01f) g_body_dir[0] = d[0] / dist, g_body_dir[1] = 0, g_body_dir[2] = d[2] / dist;
-    }
-    std::memcpy(g_body_prev, feet, sizeof feet);
-    g_body_prev_at = now;
+    coop::PartnerMotion(g_body_dir, g_body_rate);
 }
 
 // its state from the host, if the host's latest has it
@@ -352,7 +391,7 @@ void Drive(X86Context& ctx, uint32_t ch, uint32_t ctl, Puppet& pp) {
 
 }  // namespace
 
-bool IsBody(uint32_t ch) { return ch && ch == g_body; }
+bool IsBody(uint32_t ch) { return BodyIndex(ch) >= 0; }
 
 uint32_t Body() { return BodyAlive() ? g_body : 0; }
 
@@ -374,7 +413,7 @@ void Stop(X86Context& ctx) {
         if (g_puppets && !IsBody(ch) && R32(ch + kCharTeam) != 0)
             G<uint8_t>(ch + kCharKinematic) = 0;
     });
-    ReleaseBody(ctx);
+    for (int i = 0; i < coop::kMaxPlayers; i++) { coop::PartnerScope scope(i); ReleaseBody(ctx); }
     SetMode(false, false, false);
     LevelReset();
 }
@@ -440,7 +479,11 @@ void OnSnapshot(const uint8_t* p, int bytes, int count, int8_t level, uint64_t n
 }
 
 void LogicTick(X86Context& ctx) {
-    if (g_bodies) BodyTick(ctx);
+    if (g_bodies) for (int i = 0; i < coop::kMaxPlayers; i++) {
+        if (i == coop::LocalPlayer()) continue;
+        coop::PartnerScope scope(i);
+        BodyTick(ctx);
+    }
     if (!g_puppets) return;
     uint64_t now = NowMs();
     // the host not heard: its enemies here are this copy's own again, its spawners and AI theirs
@@ -473,6 +516,11 @@ void LogicTick(X86Context& ctx) {
         if (!s) {  // its unit is not here yet
             pp.tried = now;
             continue;
+        }
+        uint32_t ai = R32(kAi);
+        if (!ai || !BehaviourRoom(ai)) {
+            pp.tried = now;
+            continue; // replicated enemies need a behaviour slot as well
         }
         // the living list full: the spawn would make 0x1E6860 cull one, maybe one the host has. One the host has
         // not goes first, else it waits
@@ -530,13 +578,12 @@ void Died(uint64_t name) {
 
 void LevelReset() {
     g_hits.clear();
-    g_body = 0;  // the level's characters are gone with it
-    g_body_prev_at = 0;
-    g_body_tried = 0;
-    g_body_seen = 0;
-    g_body_rate = 0;
-    g_body_dir[0] = g_body_dir[1] = 0;
-    g_body_dir[2] = 1;
+    for (auto& body : g_body_states) {
+        // Scratch records are ours and can be reused; guest characters cannot.
+        auto source = body.source, sub = body.sub;
+        body = {};
+        body.source = source; body.sub = sub;
+    }
     g_state.clear();
     g_absent.clear();
     g_died.clear();
@@ -561,7 +608,10 @@ X86_EXTERN_FUNC(__imp__sub_001E5F70);
 X86_FUNC(sub_001E5F70) {
     uint32_t ctl = ctx.ecx;
     uint32_t ch = R32(ctl + kControlChar);
-    if (IsBody(ch) && BodyAlive()) {
+    int player = BodyIndex(ch);
+    if (player >= 0) {
+        coop::PartnerScope scope(player);
+        if (!BodyAlive()) return Return(ctx, ctx.eax, 0);
         DriveBody(ctl);
         return Return(ctx, ctx.eax, 0);
     }
@@ -575,19 +625,37 @@ X86_FUNC(sub_001E5F70) {
     __imp__sub_001E5F70(ctx, base);
 }
 
-// The locomotion selector reads BOTH controller+0x84 and character+0x2D8 (0x17AC80).
-// 0x1DFD90 measures the latter before our network placement, so a kinematic puppet
-// with no local displacement measures zero. Supply its network speed at the point
-// the animation consumes it, without giving it local physics or AI movement.
+// Animation needs measured speed AND the native gait flag / movement speed.
+// 0x17FDF0 selects S_MVI (moving idle) when +0x4A is clear. Nonzero +0x20
+// enables 0x17FC50's direction-aware gait selection (including S_MOV).
+// Supply these only while selecting animations; local physics must still see
+// zero movement speed because the remote position is applied after its update.
 X86_EXTERN_FUNC(__imp__sub_0017E280);
 X86_FUNC(sub_0017E280) {
     uint32_t ch = R32(ctx.esi);
-    if ((IsBody(ch) && BodyAlive()) || HostOwned(ch)) {
+    int player = BodyIndex(ch);
+    coop::PartnerScope scope(player >= 0 ? player : coop::CurrentPartner());
+    uint32_t controller = 0;
+    float previous_speed = 0;
+    uint8_t previous_gait = 0;
+    if ((player >= 0 && BodyAlive()) || HostOwned(ch)) {
         uint32_t ctl = R32(ch + kCharControl);
         float speed = ctl ? G<float>(ctl + kControlRate) : 0.0f;
-        G<float>(ch + 0x2D8) = std::isfinite(speed) ? std::clamp(speed, 0.0f, kBodyRun) : 0.0f;
+        speed = std::isfinite(speed) ? std::clamp(speed, 0.0f, kBodyRun) : 0.0f;
+        G<float>(ch + 0x2D8) = speed;
+        if (ctl) {
+            controller = ctl;
+            previous_speed = G<float>(ctl + kControlSpeed);
+            previous_gait = G<uint8_t>(ctl + kControlLocomotion);
+            G<float>(ctl + kControlSpeed) = speed;
+            G<uint8_t>(ctl + kControlLocomotion) = speed > 0.1f;
+        }
     }
     __imp__sub_0017E280(ctx, base);
+    if (controller) {
+        G<float>(controller + kControlSpeed) = previous_speed;
+        G<uint8_t>(controller + kControlLocomotion) = previous_gait;
+    }
 }
 
 // The characters' update (esi the pool; dt; ret 4): then each puppet is put where the host's is
@@ -599,6 +667,8 @@ X86_FUNC(sub_001CCBB0) {
     static constexpr hle::Map kSetPosMap = hle::Make({hle::ecx, hle::eax});
     static constexpr hle::Map kTeleportMap = hle::Make({hle::esi, hle::ebx});
     float k = std::clamp(std::isfinite(dt) ? dt * kFollow : 1.0f, 0.0f, 1.0f);
+    for (int player = 0; player < coop::kMaxPlayers; player++) {
+        coop::PartnerScope scope(player);
     // the partner's body where the partner stands
     float feet[3];
     if (BodyAlive() && coop::PartnerFeet(feet)) {
@@ -614,6 +684,7 @@ X86_FUNC(sub_001CCBB0) {
             std::memcpy(HostPtr(g_pos), to, 16);
             hle::Call(ctx, kSetPos, kSetPosMap, {g_body, g_pos});
         }
+    }
     }
     if (!g_puppets || !Fresh(NowMs())) return;
     for (auto& [name, pp] : g_state) {
@@ -667,24 +738,39 @@ X86_EXTERN_FUNC(__imp__sub_001AD440);
 X86_FUNC(sub_001AD440) {
     uint32_t ai = R32(kAi);
     uint32_t perception = R32(ctx.esp + 4);
-    uint32_t slot = 0;
-    float feet[3];
-    if (g_host && g_bodies && ai && BodyAlive() && coop::PartnerFeet(feet)) {  // a paused partner is not a target
-        bool in = false;
-        for (uint32_t i = 0; i < 4; i++) {
-            uint32_t at = ai + kAiSquad + i * 4, who = R32(at);
-            if (who == g_body) in = true;
-            if (!who && !slot) slot = at;
+    std::array<uint32_t, 4> original{};
+    bool replaced = false;
+    if (g_host && g_bodies && ai) {
+        std::vector<uint32_t> candidates;
+        for (int i = 0; i < 4; i++) {
+            original[i] = R32(ai + kAiSquad + uint32_t(i) * 4);
+            if (original[i]) candidates.push_back(original[i]);
         }
-        if (in) slot = 0;
-        if (slot) W32(slot, g_body);
+        for (int player = 0; player < coop::kMaxPlayers; player++) {
+            coop::PartnerScope scope(player);
+            float feet[3];
+            if (BodyAlive() && coop::PartnerFeet(feet) &&
+                std::find(candidates.begin(), candidates.end(), g_body) == candidates.end()) candidates.push_back(g_body);
+        }
+        uint32_t controller = perception ? R32(perception) : 0;
+        uint32_t enemy = controller ? R32(controller + kControlChar) : 0;
+        if (enemy && candidates.size()) {
+            const float* position = &G<float>(enemy + kCharPos);
+            auto distance = [&](uint32_t ch) {
+                float sum = 0;
+                for (int k = 0; k < 3; k++) { float d = G<float>(ch + kCharPos + uint32_t(k) * 4) - position[k]; sum += d*d; }
+                return sum;
+            };
+            std::stable_sort(candidates.begin(), candidates.end(), [&](uint32_t a, uint32_t b) { return distance(a) < distance(b); });
+            for (int i = 0; i < 4; i++) W32(ai + kAiSquad + uint32_t(i) * 4, i < int(candidates.size()) ? candidates[i] : 0);
+            replaced = true;
+        }
     }
     __imp__sub_001AD440(ctx, base);
-    if (slot) {
-        W32(slot, 0);
+    if (replaced) {
+        for (int i = 0; i < 4; i++) W32(ai + kAiSquad + uint32_t(i) * 4, original[i]);
         g_count.seen++;
-        if (R32(perception + 4) == g_body && !g_count.targeted++)
-            LOGR("coop: an enemy took the partner's body for its target");
+        if (IsBody(R32(perception + 4))) g_count.targeted++;
     }
 }
 
@@ -725,11 +811,14 @@ X86_FUNC(sub_001D6000) {
 // too (its controller's type +0x90 not an AI's while they run). A grenade's warning then goes to a real enemy
 template <class F>
 void WithoutBody(F f) {
-    uint32_t ctl = BodyAlive() ? R32(g_body + kCharControl) : 0;
-    uint32_t type = ctl ? R32(ctl + 0x90) : 0;
-    if (ctl) W32(ctl + 0x90, 0);
+    std::array<uint32_t, coop::kMaxPlayers> controls{}, types{};
+    for (int i = 0; i < coop::kMaxPlayers; i++) {
+        coop::PartnerScope scope(i);
+        controls[i] = BodyAlive() ? R32(g_body + kCharControl) : 0;
+        if (controls[i]) { types[i] = R32(controls[i] + 0x90); W32(controls[i] + 0x90, 0); }
+    }
     f();
-    if (ctl) W32(ctl + 0x90, type);
+    for (int i = 0; i < coop::kMaxPlayers; i++) if (controls[i]) W32(controls[i] + 0x90, types[i]);
 }
 
 X86_EXTERN_FUNC(__imp__sub_001C2F30);
@@ -740,4 +829,46 @@ X86_FUNC(sub_001C2F30) {
 X86_EXTERN_FUNC(__imp__sub_001C30D0);
 X86_FUNC(sub_001C30D0) {
     WithoutBody([&] { __imp__sub_001C30D0(ctx, base); });
+}
+
+// The room check every character spawn makes first (edx the pool; al: room; 0x1B25D6, 0x1B264B, 0x1B29F5, 0x1B2A85,
+// 0x1B2B15 before each 0x1AF880, and MakeBody): no room either while no behaviour slot is free. The spawner tries
+// again later instead of 0x1899F0 writing through a null slot
+X86_EXTERN_FUNC(__imp__sub_001E6860);
+X86_FUNC(sub_001E6860) {
+    __imp__sub_001E6860(ctx, base);
+    uint32_t ai = R32(kAi);
+    if ((ctx.eax & 0xFF) && ai && !BehaviourRoom(ai)) {
+        static uint64_t told = 0;
+        uint64_t now = NowMs();
+        if (now - told > 5000) {
+            told = now;
+            LOGR("npc: no behaviour slot free: a spawn waits");
+        }
+        ctx.eax &= ~0xFFu;
+    }
+}
+
+// An AI character's behaviour slot taken (ecx [AI]+0x22C48, edi the character; plain ret, al 1). A spawn that came
+// some other way with the pool full: a partner's body is let go for it (made again once there is room), else the
+// character goes without one rather than the write through null
+X86_EXTERN_FUNC(__imp__sub_001899F0);
+X86_FUNC(sub_001899F0) {
+    uint32_t ch = ctx.edi, ai = R32(kAi);
+    if (ai && ctx.ecx == ai + 0x22C48 && R32(ch + 0xC4) == 1 && !BehaviourRoom(ai)) {
+        int self = BodyIndex(ch);
+        for (int i = 0; i < coop::kMaxPlayers && !BehaviourRoom(ai); i++) {
+            if (i == self) continue;
+            coop::PartnerScope scope(i);
+            if (!BodyAlive()) continue;
+            LOGR("npc: behaviour slots full: partner %d's body let go for %016llX", i, (unsigned long long)NameOf(ch));
+            ReleaseBody(ctx);
+        }
+        if (!BehaviourRoom(ai)) {
+            LOGR("npc: behaviour slots full: %016llX goes without one", (unsigned long long)NameOf(ch));
+            W32(ch + 0x344, 0);
+            return Return(ctx, (ctx.eax & ~0xFFu) | 1, 0);
+        }
+    }
+    __imp__sub_001899F0(ctx, base);
 }

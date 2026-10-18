@@ -9,6 +9,7 @@
 // spawner, or its next. Unless this copy killed its own first and the partner had not heard of it when it killed:
 // two kills of the same one crossing, the partner's is stale. Each event carries what its sender had taken.
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "core/log.h"
 #include "game/coop.h"
 #include "game/coop_control.h"
+#include "game/coop_life.h"
 #include "game/coop_npcs.h"
 #include "game/coop_shots.h"
 #include "game/coop_world.h"
@@ -138,6 +140,7 @@ struct Event {
     int8_t level;
     uint8_t load;  // the sender's level loads: events of a load the partner has left behind are not played
     uint8_t part;
+    uint8_t actor, shooter; // stable lobby player IDs; only the killer receives kill credit
     uint32_t name_lo, name_hi;
     uint16_t ordinal;  // the sender's count of the spawner's characters, this one included: for the log
     uint8_t hit;       // 1: part, dir, dmg and noise are the killing hit's; 2: the receiver's player killed it
@@ -165,6 +168,7 @@ struct Npc {
     bool alive = false;
     bool remote = false;  // dying by the partner's word: not sent back
     bool hit = false;
+    int shooter = -1;
     bool partner = false;  // killed by the partner's bullets stepped here
     uint8_t part = 0;
     uint8_t noise = 0;
@@ -185,25 +189,42 @@ uint8_t g_load = 0;
 Counters g_count;
 
 // sender
-uint32_t g_seq = 0;
+
 struct Stamped {
     uint64_t at;
     Event e;
 };
-std::deque<Stamped> g_pending;
-
-// receiver
-uint32_t g_taken = 0;
-int g_partner_load = -1;          // the partner's level loads, and the level of its last
-int8_t g_partner_level = -1;
-std::vector<Waiting> g_waiting;  // deaths of enemies not spawned here yet, or not ready to die
-std::vector<Event> g_props;      // the partner's prop states for props not loaded here yet
-bool g_props_retry = false;      // a unit was activated: its props may be there now
-struct Arrived {
-    uint64_t at;
-    Event e;
+struct Arrived { uint64_t at; Event e; };
+struct Channel {
+    uint32_t seq = 0, taken = 0;
+    int partner_load = -1;
+    int8_t partner_level = -1;
+    std::deque<Stamped> pending;
+    std::vector<Waiting> waiting;
+    std::vector<Event> props;
+    bool props_retry = false;
+    std::deque<Arrived> projectiles;
+    std::unordered_map<uint64_t, uint32_t> own;
+    uint32_t partner_unit = 0, crossed_unit = 0;
+    float previous[3]{}, advance_last[3]{};
+    bool have_previous = false, advance_have_last = false;
+    uint64_t after = 0;
+    uint32_t advance_trigger = 0;
 };
-std::deque<Arrived> g_projectiles;  // to fire on the next step, if not late
+std::array<Channel, coop::kMaxPlayers> g_channels;
+Channel& CurrentChannel() { return g_channels[coop::CurrentPartner()]; }
+#define g_seq (CurrentChannel().seq)
+#define g_taken (CurrentChannel().taken)
+#define g_partner_load (CurrentChannel().partner_load)
+#define g_partner_level (CurrentChannel().partner_level)
+#define g_pending (CurrentChannel().pending)
+#define g_waiting (CurrentChannel().waiting)
+#define g_props (CurrentChannel().props)
+#define g_props_retry (CurrentChannel().props_retry)
+#define g_projectiles (CurrentChannel().projectiles)
+#define g_own (CurrentChannel().own)
+#define g_partner_unit (CurrentChannel().partner_unit)
+#define g_partner_crossed_unit (CurrentChannel().crossed_unit)
 bool g_rocket_replay = false;       // a partner's rocket made here: launched as the player's (0x1DDA70 bl 0)
 // the last state sent of each prop (by id, kind and part): a change to the same is not sent again
 struct PropKey {
@@ -264,16 +285,17 @@ struct Advance {
     float dir = 0;  // which way across the trigger's thin side this copy's player went (+1, -1; 0 not seen)
 };
 Advance g_advance;
-uint32_t g_partner_crossed_unit = 0;  // the farthest advance trigger the partner was seen through (for the log)
+
 bool g_rescue_on = false;  // "get me out of here" under way
+int g_rescue_partner = -1;  // by that partner, -1 the current one
 uint64_t g_rescue_at = 0;
-uint64_t g_rescue_spent = 0;     // ms of it with this copy's world taking requests or stopped by it
-bool g_rescue_advanced = false;  // this copy advanced on its way: the player must be put in the new unit
+uint64_t g_rescue_behind = 0;  // since when the partner's unit is one this copy has left
+constexpr uint64_t kBehindMs = 2000;
 constexpr uint64_t kRescueMs = 15000;
 bool g_stalled = false;    // this copy's world stopped by us at the next unit while the advance waits
 bool g_advancing = false;  // our own call of the advance
 bool g_partner_test = false;  // the partner's way through the triggers is being tested
-uint32_t g_partner_unit = 0;  // the unit the partner's copy last advanced to, this play
+
 constexpr uint8_t kFlowAdvanced = 8;  // a flow event: the sender's copy advanced to the unit in name_lo
 constexpr uint8_t kFlowContinue = 16, kFlowRestart = 17;  // the failed mission's retry, from its checkpoint or start
 constexpr uint32_t kContinueMission = 0x1240D0;  // the failed page's choices (front end, plain)
@@ -284,7 +306,7 @@ bool g_retrying = false;
 // this copy's characters, its spawns of each spawner, and its last death sent of each
 Npc g_npcs[kChars];
 std::unordered_map<uint64_t, uint16_t> g_spawns;
-std::unordered_map<uint64_t, uint32_t> g_own;
+
 int8_t g_level = -1;  // the level of this copy's last load
 uint32_t g_dir = 0;   // a 16 aligned vector
 int g_probe_lines = 0;
@@ -331,16 +353,26 @@ uint32_t NoiseClass(uint32_t wanted) {
 }
 
 // an event of this copy's to the partner: numbered, stamped with what this copy has taken, its level and load
-void Post(Event& e) {
-    e.seq = ++g_seq;
-    e.ack = g_taken;
+void Post(Event& e, bool relayed = false) {
     uint32_t world = R32(kWorld);
-    e.level = world ? G<int8_t>(world + kWorldLevel) : -1;
+    if (!relayed) {
+        e.level = world ? G<int8_t>(world + kWorldLevel) : -1;
+        e.actor = uint8_t(coop::LocalPlayer());
+    }
     e.load = g_load;
-    g_pending.push_back({NowMs(), e});
-    if (g_pending.size() > kPendingMax) {
-        g_pending.pop_front();
-        g_count.lost++;
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player) && (coop::Hosting() || player == 0)) {
+        coop::PartnerScope scope(player);
+        Event copy = e;
+        copy.seq = ++g_seq;
+        copy.ack = g_taken;
+        if (copy.type == kFlow || copy.type == kObjective)
+            copy.ordinal = g_partner_load < 0 ? 0xFFFF : uint16_t(uint8_t(g_partner_load));
+        if (copy.type == kDeath) {
+            copy.hit = uint8_t((copy.hit & ~2u) | (copy.shooter == player ? 2u : 0u));
+            if (!relayed) g_own[Name(copy.name_lo, copy.name_hi)] = copy.seq;
+        }
+        g_pending.push_back({NowMs(), copy});
+        if (g_pending.size() > kPendingMax) { g_pending.pop_front(); g_count.lost++; }
     }
     g_count.sent++;
 }
@@ -348,6 +380,7 @@ void Post(Event& e) {
 void Send(const Npc& n) {
     Event e{};
     e.type = kDeath;
+    e.shooter = uint8_t(n.shooter < 0 ? coop::LocalPlayer() : n.shooter);
     e.name_lo = uint32_t(n.name);
     e.name_hi = uint32_t(n.name >> 32);
     e.ordinal = n.ordinal;
@@ -364,7 +397,7 @@ void Send(const Npc& n) {
         e.dmg = 100;
     }
     Post(e);
-    g_own[n.name] = e.seq;
+
 }
 
 // a death on this copy: the partner's enemy too, unless the partner said so first; a cull is this copy's own
@@ -506,17 +539,23 @@ Result ApplyObjective(X86Context& ctx, const Event& e) {
 // Called before the original script action, so its event precedes any mission
 // complete event it may cause. Returning true suppresses an action already seen.
 bool ObjectiveAction(uint32_t action) {
-    if (!g_net || g_stage < 6 || !action) return false;
+    if (!action) return false;
     uint32_t data = R32(action + 0x20);
     if (!data || G<uint8_t>(data + 0x0C) != 1) return false;
     uint32_t row = Objective(Name(R32(data), R32(data + 4)));
     if (!row || !(G<uint8_t>(R32(row) + 0x15) & 0x3C)) return false;
+    if (coop::JoiningMission()) return true; // the host supplies the baseline before local progress can start
     uint64_t id = Name(R32(action + 8), R32(action + 12));
     if (!id) return false;
-    if (g_objectives_seen.count(id)) return true;
+    bool syncing = g_net && g_stage >= 6;
+    if (syncing && g_objectives_seen.count(id)) return true;
     uint32_t game = R32(kGame), state = R32(row + 8);
     if (!game || R32(game + kGameState) != game + kInLevel || (state != 1 && state != 2)) return false;
     g_objectives_seen.insert(id);
+    if (g_objective_pickup) g_collected_pickups.insert(g_objective_pickup);
+    // Hosting can start after a collection. Remember its identity offline too,
+    // while leaving the original offline script behavior unchanged.
+    if (!syncing) return false;
     Event e{};
     e.type = kObjective;
     e.name_lo = uint32_t(id), e.name_hi = uint32_t(id >> 32);
@@ -798,14 +837,17 @@ void Incoming(const uint8_t* p, int bytes, int count, uint64_t now) {
         if (int32_t(e.seq - g_taken) <= 0) continue;
         g_taken = e.seq;
         g_count.taken++;
+        if (e.actor >= coop::kMaxPlayers || (coop::Hosting() && e.actor != coop::CurrentPartner())) continue;
+        if (e.actor == coop::LocalPlayer()) continue; // acknowledged echo; the local action already ran
         PartnerLoad(e.load, e.level);
         bool reloaded = e.level == g_partner_level && e.load != uint8_t(g_partner_load);
         bool wanted = (e.type == kDeath && g_stage >= 1) || ((e.type == kProp || e.type == kProjectile) && g_stage >= 3) ||
                       (e.type == kMelee && g_stage >= 4) || ((e.type == kFlow || e.type == kObjective) && g_stage >= 6);
-        if (!wanted || reloaded) {
+        if (!wanted || reloaded || (coop::Hosting() && e.level != g_level)) {
             g_count.lost++;  // from before the partner loaded that level again
             continue;
         }
+        if (coop::Hosting()) Post(e, true);
         if (e.type == kProp) {
             if (g_props.size() >= kPropsMax) g_props.erase(g_props.begin());
             g_props.push_back(e);
@@ -829,23 +871,90 @@ void Incoming(const uint8_t* p, int bytes, int count, uint64_t now) {
 
 uint32_t Taken() { return g_taken; }
 
-void Reset() {
-    g_taken = 0;
-    g_partner_load = -1;
-    g_partner_level = -1;
-    g_waiting.clear();
-    g_props.clear();
-    g_projectiles.clear();
-    g_seq = 0;
-    g_pending.clear();
-    g_own.clear();
-    g_props_sent.clear();
-    g_partner_unit = 0;
-    g_partner_crossed_unit = 0;
+void Reset() { CurrentChannel() = {}; }
+
+namespace {
+// Fixed-width, pointer-free records. The transport sends this blob in ordered,
+// acknowledged chunks; validate the entire blob before changing the world.
+struct MissionHeader {
+    uint32_t version, rows, actions, pickups;
+    uint8_t scores[8];
+};
+struct MissionRow {
+    uint64_t name;
+    uint32_t progress, state;
+};
+static_assert(sizeof(MissionHeader) == 24 && sizeof(MissionRow) == 16);
 }
 
-void Tick(X86Context& ctx) {
+std::vector<uint8_t> MissionSnapshot() {
+    uint32_t world = R32(kWorld), stats = R32(kStats);
+    if (!world || !stats || !R32(stats)) return {};
+    uint32_t rows = R32(world + 0x930), count = R32(world + 0x934);
+    if (!rows || count > 4096 || g_objectives_seen.size() > 4096 || g_collected_pickups.size() > 4096) return {};
+    MissionHeader h{1, count, uint32_t(g_objectives_seen.size()), uint32_t(g_collected_pickups.size()), {}};
+    std::memcpy(h.scores, HostPtr(R32(stats) + 0x14), 8);
+    std::vector<uint8_t> out(sizeof h + count * sizeof(MissionRow) + (h.actions + h.pickups) * sizeof(uint64_t));
+    std::memcpy(out.data(), &h, sizeof h);
+    size_t at = sizeof h;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t row = rows + i * 12, def = R32(row);
+        if (!def) return {};
+        MissionRow r{Name(R32(def), R32(def + 4)), R32(row + 4), R32(row + 8)};
+        std::memcpy(out.data() + at, &r, sizeof r);
+        at += sizeof r;
+    }
+    for (const auto* ids : {&g_objectives_seen, &g_collected_pickups}) {
+        for (uint64_t id : *ids) {
+            std::memcpy(out.data() + at, &id, sizeof id);
+            at += sizeof id;
+        }
+    }
+    return out;
+}
+
+bool RestoreMissionSnapshot(const uint8_t* data, size_t bytes) {
+    if (bytes < sizeof(MissionHeader)) return false;
+    MissionHeader h;
+    std::memcpy(&h, data, sizeof h);
+    if (h.version != 1 || h.rows > 4096 || h.actions > 4096 || h.pickups > 4096 ||
+        bytes != sizeof h + h.rows * sizeof(MissionRow) + (h.actions + h.pickups) * sizeof(uint64_t)) return false;
+    uint32_t world = R32(kWorld), stats = R32(kStats);
+    if (!world || !stats || !R32(stats) || R32(world + 0x934) != h.rows) return false;
+    std::vector<std::pair<uint32_t, MissionRow>> rows;
+    size_t at = sizeof h;
+    for (uint32_t i = 0; i < h.rows; i++) {
+        MissionRow r;
+        std::memcpy(&r, data + at, sizeof r);
+        at += sizeof r;
+        uint32_t row = Objective(r.name);
+        if (!row || r.state > 3 || r.progress > 256) return false;
+        rows.push_back({row, r});
+    }
+    for (const auto& [row, r] : rows) {
+        W32(row + 4, r.progress);
+        W32(row + 8, r.state);
+    }
+    g_objectives_seen.clear();
+    g_collected_pickups.clear();
+    for (auto [ids, count] : {std::pair{&g_objectives_seen, h.actions}, std::pair{&g_collected_pickups, h.pickups}}) {
+        for (uint32_t i = 0; i < count; i++) {
+            uint64_t id;
+            std::memcpy(&id, data + at, sizeof id);
+            at += sizeof id;
+            ids->insert(id);
+        }
+    }
+    std::memcpy(HostPtr(R32(stats) + 0x14), h.scores, 8);
+    LOGR("coop: restored host mission progress: %u objectives, %u collections, %u pickups", h.rows, h.actions, h.pickups);
+    return true;
+}
+
+void TickOne(X86Context& ctx) {
     if (g_stage < 1) return;
+    // The snapshot supplies the baseline and action-ID set first. Events made
+    // during loading can then merge without counting the same item twice.
+    if (coop::JoiningMission()) return;
     uint32_t world = R32(kWorld);
     int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
     // the partner's projectiles, at once or not at all
@@ -887,6 +996,13 @@ void Tick(X86Context& ctx) {
     HideCollectedPickups(ctx);
 }
 
+void Tick(X86Context& ctx) {
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+        coop::PartnerScope scope(player);
+        TickOne(ctx);
+    }
+}
+
 // From the loader's bullet reset (0x1EDE4C), the new level already in world+0x5AEC (0x1EDD64)
 void LevelReset() {
     g_objectives_seen.clear();
@@ -894,23 +1010,25 @@ void LevelReset() {
     g_objective_pickup = 0;
     for (Npc& n : g_npcs) n = {};
     g_spawns.clear();
-    g_own.clear();
     g_props_sent.clear();
     g_advance = {};
-    g_partner_crossed_unit = 0;
-    g_partner_unit = 0;
     g_stalled = false;
     g_rescue_on = false;
     uint32_t world = R32(kWorld);
     int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
-    // ours of this level, loaded again, are void on the partner; of another level they still stand
-    std::erase_if(g_pending, [&](const Stamped& s) { return s.e.level == level; });
-    // the partner's of any other level would only meet a later play of it
-    std::erase_if(g_waiting, [&](const Waiting& w) { return w.e.level != level; });
-    std::erase_if(g_props, [&](const Event& e) { return e.level != level; });
-    g_projectiles.clear();
-    g_props_retry = true;
+    for (auto& channel : g_channels) {
+        channel.own.clear();
+        channel.partner_unit = channel.crossed_unit = 0;
+        channel.have_previous = channel.advance_have_last = false;
+        channel.advance_trigger = 0;
+        std::erase_if(channel.pending, [&](const Stamped& item) { return item.e.level == level; });
+        std::erase_if(channel.waiting, [&](const Waiting& item) { return item.e.level != level; });
+        std::erase_if(channel.props, [&](const Event& item) { return item.level != level; });
+        channel.projectiles.clear();
+        channel.props_retry = true;
+    }
     coop::npcs::LevelReset();
+    coop::life::LevelReset();
     coop::control::LevelReset();
     g_level = level;
     g_load++;
@@ -954,32 +1072,22 @@ uint32_t SlotOfUnit(uint32_t world, uint32_t unit) {
     return 0;
 }
 
-// the farthest unit the partner has reached in this play: its copy's current unit, the one its advance waits for
-// (its player is past that trigger now: its copy gives the advance up when it goes back) and the advances it told
-// of. Its walk seen through this copy's triggers is not counted: it may have gone back since
+// the farthest unit the partner has reached in this play: its copy's current unit, the one it waits to advance to
+// (it went through that advance's trigger), the advances it told of and the advance triggers it was seen through
 uint32_t PartnerReached() {
     int waiting = 0;
     int unit = coop::PartnerUnit(nullptr, &waiting);
-    uint32_t r = g_partner_unit;
+    uint32_t r = std::max(g_partner_unit, g_partner_crossed_unit);
     if (unit > 0) r = std::max(r, uint32_t(std::max(unit, waiting)));
     return r;
 }
 
-// the world update gets past its gates to the streaming switch (0x1F10C7-0x1F1121): not paused (game+0x210C8),
-// not in a sequence (+0x21090, +0x2109C), not stopped (+0x210C9), the level in play (world+0x5AE0)
-bool Steps(uint32_t world, uint32_t game) {
-    uint32_t sequence = R32(game + 0x2109C);
-    return !G<uint8_t>(game + 0x210C8) && R32(game + 0x21090) != 1 && (sequence < 1 || sequence > 3) &&
-           R32(world + 0x5AE0) == kSlotLoaded && !G<uint8_t>(game + kGameStalled);
-}
-
-// this copy's world stopped by us, as the game stops it for a unit still loading (0x1C764C): units still stream
-// (0x1F109A, before the gate), the player stands
-void Stall() {
-    uint32_t game = R32(kGame);
-    if (!game || g_stalled || R32(game + kGameStall) == 1) return;
-    W32(game + kGameStall, 1);
-    g_stalled = true;
+bool WaitingForPlayers(uint32_t unit) {
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+        coop::PartnerScope scope(player);
+        if (coop::PartnerInLevel() && !coop::PartnerDown() && PartnerReached() < unit) return true;
+    }
+    return false;
 }
 
 // where a point is across a trigger's thin side, in its own frame (+0x70 world to local), and that side's half size
@@ -990,6 +1098,25 @@ float AcrossTrigger(uint32_t t, const float p[3], float& half) {
     float local = G<float>(t + 0xA0 + uint32_t(k) * 4);
     for (int j = 0; j < 3; j++) local += p[j] * G<float>(t + 0x70 + uint32_t(j) * 16 + uint32_t(k) * 4);
     return local;
+}
+
+// a point behind a trigger's thin side (the way 'dir' came from) and by its box: within its other sides and a few
+// metres back
+bool BackAtTrigger(uint32_t t, const float p[3], float dir) {
+    const float* h = &G<float>(t + 0x130);
+    int thin = h[0] <= h[1] && h[0] <= h[2] ? 0 : h[1] <= h[2] ? 1 : 2;
+    constexpr float kMargin = 1.5f, kBack = 6.0f;
+    for (int k = 0; k < 3; k++) {
+        float local = G<float>(t + 0xA0 + uint32_t(k) * 4);
+        for (int j = 0; j < 3; j++) local += p[j] * G<float>(t + 0x70 + uint32_t(j) * 16 + uint32_t(k) * 4);
+        if (k == thin) {
+            float back = -local * dir;
+            if (back < h[k] || back > h[k] + kBack) return false;
+        } else if (std::fabs(local) > h[k] + kMargin) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // the waiting advance given up: its trigger armed again, so this copy's player asks for it once more going through
@@ -1019,10 +1146,9 @@ void ApplyAdvance(X86Context& ctx, const char* why) {
     uint32_t world = R32(kWorld);
     uint32_t unit = g_advance.unit;
     if (!world) return;
-    // this copy's player back on the side it came from: the unit it stands in would go
-    float half;
-    float side = AcrossTrigger(g_advance.trigger, &G<float>(Player() + kPlayerFeet), half);
-    if (g_advance.dir != 0 && side * g_advance.dir < -half) {
+    // this copy's player back at the trigger, on the side it came from: the unit it stands in would go. Only by the
+    // trigger's box: away from it, the plane's side says nothing (a way on that turns, stairs, a bend, goes behind it)
+    if (g_advance.dir != 0 && BackAtTrigger(g_advance.trigger, &G<float>(Player() + kPlayerFeet), g_advance.dir)) {
         CancelAdvance(ctx, "this player went back");
         return;
     }
@@ -1032,112 +1158,64 @@ void ApplyAdvance(X86Context& ctx, const char* why) {
     LOGR("coop: advance to unit %u, %s", unit, why);
 }
 
-void EndRescue(X86Context& ctx) {
-    g_rescue_on = false;
-    g_rescue_advanced = false;
-    Resume(ctx);
-}
-
-// "get me out of here". The partner in this copy's unit: the next unit activated if the partner has it, the player
-// put by the partner, and if the partner waits past its advance trigger this copy advances with the player past it
-// too (put first: the unit it leaves goes with no one in it). The partner's copy units ahead (it went on alone):
-// this copy brought there one streaming step at a time, its world stopped while each unit loads, the player put at
-// the end. Requests are made only while the world update takes them; a pause or a load does not count
+// "get me out of here": this copy brought to the partner's unit one streaming step a frame (the next unit
+// activated, then advanced to), and the player put by the partner once that unit is here
 void RescueTick(X86Context& ctx) {
     if (!g_rescue_on) return;
-    uint32_t world = R32(kWorld), game = R32(kGame);
+    coop::PartnerScope scope(g_rescue_partner >= 0 ? g_rescue_partner : coop::CurrentPartner());
+    uint32_t world = R32(kWorld);
     uint64_t now = NowMs();
-    uint64_t dt = now - g_rescue_at;
-    g_rescue_at = now;
-    if (!world || !game) {
-        EndRescue(ctx);
+    if (!world || now - g_rescue_at > kRescueMs) {
+        LOGR("coop: get me out of here: given up, the partner's unit did not come");
+        g_rescue_on = false;
         return;
     }
-    uint32_t sequence = R32(game + 0x2109C);
-    bool held = G<uint8_t>(game + 0x210C8) || R32(game + 0x21090) == 1 || (sequence >= 1 && sequence <= 3) ||
-                R32(world + 0x5AE0) != kSlotLoaded;  // its pause, a sequence, a load: the rescue waits
-    if (held) return;
-    g_rescue_spent += dt;
-    uint32_t stream = R32(world + kWorldStream);
-    if (stream) {  // a request (ours or the game's) under way: the world takes it
-        Resume(ctx);
-        return;
-    }
-    bool steps = Steps(world, game);
     int next_active = 0, waiting = 0;
     int unit = coop::PartnerUnit(&next_active, &waiting);
-    uint32_t current = R32(world + kWorldUnit);
     if (unit <= 0) {
         LOGR("coop: get me out of here: the partner is not in this level");
-        if (g_rescue_advanced) coop::PlaceByPartner(uint8_t(current));  // its last place here, if any
-        EndRescue(ctx);
-        return;
-    }
-    if (!g_rescue_advanced && g_rescue_spent > kRescueMs) {
-        LOGR("coop: get me out of here: given up, the partner's unit did not come");
-        EndRescue(ctx);
-        return;
-    }
-    if (g_rescue_spent > kRescueMs * 4) {  // advanced and its next units never came: put where it can be
-        LOGR("coop: get me out of here: the partner's units did not come, put at its last place here");
-        coop::PlaceByPartner(uint8_t(current));
-        EndRescue(ctx);
+        g_rescue_on = false;
         return;
     }
     // where the partner stands: its current unit, or the one it waits to advance to (it is past that trigger)
     uint32_t target = uint32_t(std::max(unit, waiting));
-    if (current > target) {  // nothing of this copy's went before the player was put: it can stay as it is
-        LOGR("coop: get me out of here: the partner's unit %u is left behind here", target);
-        EndRescue(ctx);
+    uint32_t current = R32(world + kWorldUnit);
+    if (current > target) {  // the partner's copy may be a frame or two into the same advance
+        if (!g_rescue_behind) g_rescue_behind = now;
+        if (now - g_rescue_behind > kBehindMs) {
+            LOGR("coop: get me out of here: the partner's unit %u is left behind here", target);
+            g_rescue_on = false;
+        }
         return;
     }
-    if (uint32_t(unit) > current) {
+    g_rescue_behind = 0;
+    if (g_stalled) Resume(ctx);
+    if (R32(world + kWorldStream)) return;  // a streaming step of the game's still going
+    if (current < target) {
         uint32_t s = SlotOfUnit(world, current + 1);
-        if (!s || R32(s) != kSlotLoaded) {  // still loading: the player stands meanwhile
-            Stall();
-            return;
-        }
-        if (!steps) {  // stopped by us: it goes on for the request
-            Resume(ctx);
-            return;
-        }
+        if (!s || R32(s) != kSlotLoaded) return;  // still loading
         if (!G<uint8_t>(s + kSlotActive2)) {
             Activate(ctx, world, current);
             return;
         }
         g_advance = {};
         Advance(ctx, world, current + 1);
-        g_rescue_advanced = true;
         LOGR("coop: get me out of here: advance to unit %u, the partner's way", current + 1);
         return;
     }
-    // the partner in this copy's unit: its next one here too when the partner has it or waits past its trigger
-    if (next_active || target > current) {
+    // the partner's unit is this copy's: its next one too if the partner has it active
+    if (next_active && waiting <= int(current)) {
         uint32_t s = SlotOfUnit(world, current + 1);
-        if (!s || R32(s) != kSlotLoaded) {
-            Stall();
-            return;
-        }
+        if (!s || R32(s) != kSlotLoaded) return;
         if (!G<uint8_t>(s + kSlotActive2)) {
-            if (!steps) {
-                Resume(ctx);
-                return;
-            }
             Activate(ctx, world, current);
             return;
         }
     }
     // this copy's advance waiting past the partner's place: the player goes back before it
     if (g_advance.trigger && g_advance.unit > target) CancelAdvance(ctx, "this player put back by the partner");
-    bool placed = coop::PlaceByPartner(uint8_t(target));
-    if (placed && target > current) {
-        // the partner waits past its advance trigger: this player, past it too now, goes through it with the partner
-        g_advance = {};
-        Resume(ctx);
-        Advance(ctx, world, target);
-        LOGR("coop: get me out of here: advance to unit %u with the partner", target);
-    }
-    EndRescue(ctx);
+    g_rescue_on = false;
+    coop::PlaceByPartner(uint8_t(target));
 }
 
 }  // namespace
@@ -1150,8 +1228,13 @@ void AskRescue() {
     }
     g_rescue_on = true;
     g_rescue_at = NowMs();
-    g_rescue_spent = 0;
-    g_rescue_advanced = false;
+    g_rescue_behind = 0;
+    g_rescue_partner = -1;
+}
+
+void AskRescueTo(int player) {
+    AskRescue();
+    g_rescue_partner = player;
 }
 
 void Stop(X86Context& ctx) {
@@ -1166,7 +1249,7 @@ void Stop(X86Context& ctx) {
 
 // Each frame, the world stopped or not: the advance waiting for the partner goes once the partner has gone through
 // its trigger too (or left the level); a rescue's steps; the partner's flow events a stopped world would not take
-void FlowTick(X86Context& ctx) {
+void FlowMessages(X86Context& ctx, bool& outcome) {
     uint32_t world = R32(kWorld);
     int8_t level = world ? G<int8_t>(world + kWorldLevel) : int8_t(-1);
     auto this_play = [&](const Event& e) { return e.level == level && (e.ordinal == 0xFFFF || uint8_t(e.ordinal) == g_load); };
@@ -1195,7 +1278,7 @@ void FlowTick(X86Context& ctx) {
         ++it;
     }
     // the partner's copy advanced: this copy's waiting advance to that unit goes, a later one of ours need not wait
-    bool outcome = false;  // the partner's mission failed or level complete is waiting
+
     for (auto it = g_waiting.begin(); it != g_waiting.end();) {
         const Event& e = it->e;
         if (e.type == kFlow && (e.part == 1 || e.part == 2) && this_play(e)) outcome = true;
@@ -1209,7 +1292,7 @@ void FlowTick(X86Context& ctx) {
         }
         it = g_waiting.erase(it);
     }
-    RescueTick(ctx);
+
     // this copy's next unit activated as the partner's is: its enemies made there too
     int next_active = 0;
     int unit = coop::PartnerUnit(&next_active, nullptr);
@@ -1221,6 +1304,17 @@ void FlowTick(X86Context& ctx) {
             LOGR("coop: unit %d activated, as the partner's", unit + 1);
         }
     }
+ }
+
+void FlowTick(X86Context& ctx) {
+    bool outcome = false;
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+        coop::PartnerScope scope(player);
+        FlowMessages(ctx, outcome);
+    }
+    coop::life::Tick(ctx);
+    RescueTick(ctx);
+    uint32_t world = R32(kWorld);
     if (!g_advance.trigger) return;
     uint32_t t = g_advance.trigger;
     if (!world || R32(t) != kTriggerVtable || Name(R32(t + 0x08), R32(t + 0x0C)) != g_advance.id) {
@@ -1233,19 +1327,43 @@ void FlowTick(X86Context& ctx) {
         CancelAdvance(ctx, "the partner's mission ended");
         return;
     }
-    // this copy's player back behind the trigger: the advance waits no more, so what it tells the partner (State
-    // .waiting, its walk's reach) means past the trigger now. Not seen which way it went: the side it leaves it by
-    float half;
-    float side = AcrossTrigger(t, &G<float>(Player() + kPlayerFeet), half);
-    if (g_advance.dir == 0 && std::fabs(side) > half) g_advance.dir = side > 0 ? 1.0f : -1.0f;
-    if (g_advance.dir != 0 && side * g_advance.dir < -half) {
-        CancelAdvance(ctx, "this player went back");
-        return;
-    }
     uint64_t now = NowMs();
-    if (coop::PartnerInLevel()) g_advance.partner_seen = now;
+    bool any = false;
+    uint32_t reached = g_advance.unit;
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+        coop::PartnerScope scope(player);
+        if (!coop::PartnerInLevel() || coop::PartnerDown()) continue;  // the down follow at the checkpoint
+        any = true;
+        g_advance.partner_seen = now;
+        auto& channel = CurrentChannel();
+        if (channel.advance_trigger != t) {
+            channel.advance_trigger = t;
+            channel.advance_have_last = false;
+        }
+    float feet[3];
+    if (PartnerReached() < g_advance.unit && coop::PartnerAt(feet)) {
+        // the partner's way since the last frame through the trigger, as 0x1C9270 sweeps the player's
+        static uint32_t pos = 0, saved = 0;
+        if (!pos) pos = mem::AllocSystem(16, 16), saved = mem::AllocSystem(16, 16);
+        const float* from = channel.advance_have_last ? channel.advance_last : feet;
+        float d[3] = {feet[0] - from[0], feet[1] - from[1], feet[2] - from[2]};
+        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 9.0f) from = feet;  // a jump, not a walk: where it lands
+        uint32_t last = world + kWorldLastPos;
+        std::memcpy(HostPtr(saved), HostPtr(last), 16);
+        float at[4] = {feet[0], feet[1], feet[2], 1}, start[4] = {from[0], from[1], from[2], 1};
+        std::memcpy(HostPtr(pos), at, 16);
+        std::memcpy(HostPtr(last), start, 16);
+        static constexpr hle::Map kInsideMap = hle::Make({hle::eax, hle::ebx});
+        bool crossed = hle::Call(ctx, kInside, kInsideMap, {t, pos}) & 0xFF;
+        std::memcpy(HostPtr(last), HostPtr(saved), 16);
+        std::memcpy(channel.advance_last, feet, sizeof feet);
+        channel.advance_have_last = true;
+        if (crossed) g_partner_crossed_unit = std::max(g_partner_crossed_unit, g_advance.unit);
+    }
+        reached = std::min(reached, PartnerReached());
+    }
     if (R32(world + kWorldStream)) return;  // never over a streaming step in progress
-    if (PartnerReached() >= g_advance.unit) ApplyAdvance(ctx, "the partner came");
+    if (any && reached >= g_advance.unit) ApplyAdvance(ctx, "all partners came");
     else if (now - g_advance.partner_seen > kAloneMs) ApplyAdvance(ctx, "the partner is not in the level");
 }
 
@@ -1334,10 +1452,11 @@ void TestPartner(X86Context& ctx, uint32_t mgr, const float from[3], const float
 
 }  // namespace
 
-void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
-    static float prev[3];
-    static bool have_prev = false;
-    static uint64_t after = 0;
+void PartnerTriggersOne(X86Context& ctx, uint32_t mgr) {
+    auto& channel = CurrentChannel();
+    auto& prev = channel.previous;
+    auto& have_prev = channel.have_previous;
+    auto& after = channel.after;
     float feet[3];
     uint32_t world = R32(kWorld);
     if (!g_net || g_stage < 2 || !world || !mgr || !coop::PartnerFeet(feet)) {
@@ -1365,6 +1484,13 @@ void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
     }
 }
 
+void PartnerTriggers(X86Context& ctx, uint32_t mgr) {
+    for (int player = 0; player < coop::kMaxPlayers; player++) if (coop::Connected(player)) {
+        coop::PartnerScope scope(player);
+        PartnerTriggersOne(ctx, mgr);
+    }
+}
+
 }  // namespace coop::world
 
 using namespace coop::world;
@@ -1384,6 +1510,12 @@ X86_FUNC(sub_001C2290) {
 // as well; ammunition and health without an objective stay local.
 X86_EXTERN_FUNC(__imp__sub_001E4580);
 X86_FUNC(sub_001E4580) {
+    if (coop::JoiningMission()) {
+        // Catch-up can place the player over a collectible before its snapshot
+        // arrives. Defer collision/collection until that baseline is installed.
+        ctx.esp += 8;
+        return;
+    }
     uint64_t previous = g_objective_pickup;
     uint32_t p = ctx.ecx;
     // Its base update performs collision tests and may mark it collected during
@@ -1429,6 +1561,7 @@ X86_FUNC(sub_00205C60) {
         std::memcpy(n.dir, HostPtr(R32(ctx.esp + 0x10)), 16);
         n.dmg = G<float>(ctx.esp + 0x14);
         n.partner = coop::shots::SteppingPartner();
+        n.shooter = n.partner ? coop::CurrentPartner() : coop::LocalPlayer();
     }
     __imp__sub_00205C60(ctx, base);
 }
@@ -1549,12 +1682,8 @@ X86_FUNC(sub_001B73B0) {
     uint32_t info = world ? R32(world + kWorldLevelInfo) : 0;
     uint32_t current = world ? R32(world + kWorldUnit) : 0;
     bool asks = info && current != G<uint8_t>(info + 0x11) && current + 1 == unit;
-    if (asks && !g_advancing && g_net && g_stage >= 6 && t && R32(t) == kTriggerVtable && coop::PartnerInLevel() &&
-        PartnerReached() < unit) {
-        if (!g_advance.trigger) LOGR("coop: the advance to unit %u waits for the partner", unit);
-        uint32_t old = g_advance.trigger;  // another trigger of the same advance: the one before asks again
-        if (old && old != t && R32(old) == kTriggerVtable && Name(R32(old + 0x08), R32(old + 0x0C)) == g_advance.id)
-            G<uint8_t>(old + kTriggerArmed) = 1;
+    if (asks && !g_advancing && g_net && g_stage >= 6 && t && R32(t) == kTriggerVtable && WaitingForPlayers(unit)) {
+        bool first = !g_advance.trigger;
         g_advance = {};
         g_advance.trigger = t, g_advance.id = Name(R32(t + 0x08), R32(t + 0x0C)), g_advance.unit = unit;
         g_advance.partner_seen = NowMs();
@@ -1562,9 +1691,8 @@ X86_FUNC(sub_001B73B0) {
         float half;
         float now = AcrossTrigger(t, &G<float>(Player() + kPlayerFeet), half);
         float before = AcrossTrigger(t, &G<float>(world + kWorldLastPos), half);
-        // the side it came from, where a frame ago was out of the box; else the way it moved
-        if (std::fabs(before) >= half) g_advance.dir = before > 0 ? -1.0f : 1.0f;
-        else g_advance.dir = now - before > 0.001f ? 1.0f : now - before < -0.001f ? -1.0f : 0.0f;
+        g_advance.dir = now - before > 0.001f ? 1.0f : now - before < -0.001f ? -1.0f : 0.0f;
+        if (first) LOGR("coop: the advance to unit %u waits for the partner (crossed %+.0f)", unit, double(g_advance.dir));
         return Return(ctx, ctx.eax, 1);
     }
     if (asks) SendFlow(kFlowAdvanced, unit, 0);  // the partner's copy waiting for it goes too
@@ -1576,8 +1704,7 @@ X86_FUNC(sub_001B73B0) {
 X86_EXTERN_FUNC(__imp__sub_001C7620);
 X86_FUNC(sub_001C7620) {
     uint32_t world = ctx.esi, unit = ctx.ecx;
-    if (g_advance.trigger && !g_partner_test && !g_rescue_on && world && unit == g_advance.unit &&
-        R32(world + kWorldUnit) + 1 == unit) {
+    if (g_advance.trigger && !g_partner_test && world && unit == g_advance.unit && R32(world + kWorldUnit) + 1 == unit) {
         uint32_t game = R32(kGame);
         if (game && !g_stalled && R32(game + kGameStall) != 1) {
             W32(game + kGameStall, 1);
@@ -1593,6 +1720,7 @@ X86_FUNC(sub_001C7620) {
 // too. Its vf7 (0x1F4590) is a scripted lock of the player (a cinematic, on and off): each copy's script makes its own
 X86_EXTERN_FUNC(__imp__sub_001F45C0);
 X86_FUNC(sub_001F45C0) {
+    if (!g_applying && coop::life::HoldDeath()) return Return(ctx, ctx.eax, 1);  // down: the team plays on
     uint32_t game = R32(kGame);
     if (game && ctx.ecx == game + kInLevel && !(R32(ctx.ecx + 0x0C) & 1) && R32(ctx.ecx + 0x08) != game + 0x2103C)
         SendFlow(1, 0, 0);  // once: its death and 0x1C6410 may both ask

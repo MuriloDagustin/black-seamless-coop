@@ -3,3 +3,9 @@ black-recomp/
 assets/
 *.iso
 *.xbe
+
+# EOS: product credentials and SDK files stay local
+coop-online.toml
+EOSSDK-*.dll
+third_party/
+__pycache__/

@@ -1,0 +1,12 @@
+# Copy beside BLACK.exe as coop-online.toml. Both PCs use the SAME product,
+# sandbox, deployment and restricted game-client credentials from your portal.
+# Never use an administrative / trusted-server client in a distributed build.
+product_id = ""
+sandbox_id = ""
+deployment_id = ""
+client_id = ""
+client_secret = ""
+# Choose your nickname in F10 > CO-OP; it is saved in black.toml.
+# Useful for connectivity testing. Normally direct P2P is attempted first and
+# EOS uses its relay when necessary. This is not a VPN or a dedicated game host.
+force_relay = false

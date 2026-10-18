@@ -8,8 +8,11 @@ namespace coop::net {
 struct Peer {
     uint32_t addr = 0;  // IPv4, network order
     uint16_t port = 0;  // host order
+    uint64_t online = 0; // opaque EOS peer; zero for UDP, never sent on the wire
 };
-inline bool operator==(const Peer& a, const Peer& b) { return a.addr == b.addr && a.port == b.port; }
+inline bool operator==(const Peer& a, const Peer& b) {
+    return a.addr == b.addr && a.port == b.port && a.online == b.online;
+}
 
 bool Open(uint16_t port);                  // 0: any free port
 void Close();
