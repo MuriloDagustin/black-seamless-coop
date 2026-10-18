@@ -7,7 +7,7 @@ Jogue a campanha do **Black** (Criterion, 2006) junto com até **8 jogadores**, 
 Este é um mod para a [BLACK-XBERecomp](https://github.com/TGP482/BLACK-XBERecomp), uma port nativa e não
 oficial do jogo original do Xbox para PC (uma recompilação estática feita com o
 [XboxXBE-Recomp](https://github.com/TGP482/XboxXBE-Recomp)). O Black nunca teve multiplayer: tudo aqui foi
-construído em cima do próprio código do jogo, então espere algumas arestas.
+construído em cima do próprio código do jogo, então espere alguns probleminhas (zerei o jogo com amigos e tudo que foi encontrado por nós foi corrigido).
 
 > **Você precisa da sua própria cópia do Black (Xbox, versão USA).** Este repositório tem só o código do
 > co-op. Ele não tem arquivos do jogo nem código da port ou do recompilador.
