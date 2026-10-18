@@ -216,7 +216,7 @@ index 4cf9854..45fb2f2 100644
      g_focus_paused = true;
      audio::SetPaused(true);
 diff --git a/src/common/game_info.cpp b/src/common/game_info.cpp
-index d839025..30d0521 100644
+index d839025..fb7e20f 100644
 --- a/src/common/game_info.cpp
 +++ b/src/common/game_info.cpp
 @@ -13,10 +13,15 @@
@@ -331,7 +331,7 @@ index d839025..30d0521 100644
      t.insert("mouse_sensitivity", double(o.mouse_sensitivity));
      t.insert("language", o.language);
      toml::table keys;
-@@ -163,6 +210,7 @@ const app::GameInfo app::kGame = {
+@@ -163,14 +210,18 @@ const app::GameInfo app::kGame = {
                  {"invert_mouse", &game::Opt().invert_mouse, nullptr},
                  {"hold_aim", &game::Opt().hold_aim, nullptr},
                  {"walk_speed", nullptr, &game::Opt().walk_speed},
@@ -339,7 +339,8 @@ index d839025..30d0521 100644
                  {"fov", nullptr, &game::Opt().fov},
                  {"msaa", nullptr, &game::Opt().msaa},
                  {"smaa", &game::Opt().smaa, nullptr},
-@@ -170,7 +218,9 @@ const app::GameInfo app::kGame = {
++                {"sharpening", nullptr, &game::Opt().sharpening},
+                 {"pause_on_focus_loss", &game::Opt().pause_on_focus_loss, nullptr},
                  {"draw_distance", nullptr, &game::Opt().draw_distance},
                  {"ambient_occlusion", nullptr, &game::Opt().ambient_occlusion},
                  {"viewmodel_fov", nullptr, &game::Opt().viewmodel_fov},
@@ -351,7 +352,7 @@ index d839025..30d0521 100644
      .save = game::Save,
      .init = game::Init,
 diff --git a/src/common/menu.cpp b/src/common/menu.cpp
-index f5cc7c0..901dd9c 100644
+index f5cc7c0..127171e 100644
 --- a/src/common/menu.cpp
 +++ b/src/common/menu.cpp
 @@ -29,6 +29,7 @@
@@ -362,16 +363,27 @@ index f5cc7c0..901dd9c 100644
  
  namespace app {
  
-@@ -226,7 +227,7 @@ void Changed(bool display) {
+@@ -226,9 +227,9 @@ void Changed(bool display) {
  }
  
  enum RowId { kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFpsCounter, kAniso, kReloadBlur,
 -             kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
 +             kSkipIntros, kSensitivity, kInvertMouse, kWalkSpeed, kSprintSpeed, kFov, kViewmodelFov, kHoldAim, kDrawDistance, kMsaa,
               kAmbientOcclusion, kAudioOutput, kHdrOutput, kMonitor, kLanguage, kSmaa,
-              kPauseOnFocusLoss, kFmvScale };
+-             kPauseOnFocusLoss, kFmvScale };
++             kPauseOnFocusLoss, kFmvScale, kSharpening };
  
-@@ -271,6 +272,7 @@ const std::vector<Row>& InputRows() {
+ using rows::Kind;
+ using rows::Row;
+@@ -249,6 +250,7 @@ constexpr Row kSettingsRows[] = {
+     {Kind::Heading, -1, "GRAPHICS"},
+     {Kind::Value, kMsaa, "MSAA"},
+     {Kind::Value, kSmaa, "SMAA"},
++    {Kind::Value, kSharpening, "SHARPENING"},
+     {Kind::Value, kAniso, "ANISOTROPIC FILTERING"},
+     {Kind::Value, kDrawDistance, "DRAW DISTANCE"},
+     {Kind::Value, kAmbientOcclusion, "AMBIENT OCCLUSION"},
+@@ -271,6 +273,7 @@ const std::vector<Row>& InputRows() {
          const input::Action* actions = input::Actions(&count);
          for (size_t i = 0; i < count; i++) out.push_back({Kind::Bind, int(i), actions[i].label});
          out.push_back({Kind::Value, kWalkSpeed, "WALK SPEED"});
@@ -379,10 +391,16 @@ index f5cc7c0..901dd9c 100644
          return out;
      }();
      return list;
-@@ -465,6 +467,11 @@ void StepInputRow(int id, int step, char (&text)[64]) {
+@@ -465,6 +468,17 @@ void StepInputRow(int id, int step, char (&text)[64]) {
              if (step) o.walk_speed = uint32_t(StepRange(int(o.walk_speed), 10, 100, 5, step));
              std::snprintf(text, sizeof(text), "%u%%", o.walk_speed);
              break;
++        case kSharpening:
++            // off, then 10% to 100% in steps of 10
++            if (step) o.sharpening = uint32_t(StepRange(int(o.sharpening), 0, 100, 10, step));
++            if (o.sharpening) std::snprintf(text, sizeof(text), "%u%%", o.sharpening);
++            else std::snprintf(text, sizeof(text), "OFF");
++            break;
 +        case kSprintSpeed:
 +            // 100% (off) to 250% in steps of 10
 +            if (step) o.sprint_speed = uint32_t(StepRange(int(o.sprint_speed), 100, 250, 10, step));
@@ -391,7 +409,7 @@ index f5cc7c0..901dd9c 100644
          case kLanguage: {
              int count = int(std::size(game::kLanguages));
              int i = 0;
-@@ -502,9 +509,10 @@ std::string KeyText(std::string keys) {
+@@ -502,9 +516,10 @@ std::string KeyText(std::string keys) {
      return keys;
  }
  
@@ -403,7 +421,7 @@ index f5cc7c0..901dd9c 100644
  
  void RestoreDefaults(int page) {
      game::Options& o = game::Opt();
-@@ -513,6 +521,7 @@ void RestoreDefaults(int page) {
+@@ -513,6 +528,7 @@ void RestoreDefaults(int page) {
          o.invert_mouse = false;
          o.hold_aim = true;
          o.walk_speed = game::Options{}.walk_speed;
@@ -411,7 +429,7 @@ index f5cc7c0..901dd9c 100644
          input::ResetBindings();
          return;
      }
-@@ -523,6 +532,7 @@ void RestoreDefaults(int page) {
+@@ -523,6 +539,7 @@ void RestoreDefaults(int page) {
      o.invert_mouse = keep.invert_mouse;
      o.hold_aim = keep.hold_aim;
      o.walk_speed = keep.walk_speed;
@@ -419,7 +437,7 @@ index f5cc7c0..901dd9c 100644
      o.keys = keep.keys;
      Changed(true);
  }
-@@ -653,7 +663,118 @@ void KeyRow(const Row& r) {
+@@ -653,7 +670,118 @@ void KeyRow(const Row& r) {
      g_capture_armed = false;
  }
  
@@ -538,7 +556,7 @@ index f5cc7c0..901dd9c 100644
      size_t count = 0;
      const Row* list = rows::Page(page, &count);
      for (size_t i = 0; i < count; i++) {
-@@ -665,6 +786,7 @@ void DrawRows(int page) {
+@@ -665,6 +793,7 @@ void DrawRows(int page) {
  }
  
  void Defaults() {
@@ -546,7 +564,7 @@ index f5cc7c0..901dd9c 100644
      g_capture = -1;
      if (g_page == kSettingsPage) g_display_held = false;
      RestoreDefaults(g_page);
-@@ -723,7 +845,9 @@ void DrawFooter(float em) {
+@@ -723,7 +852,9 @@ void DrawFooter(float em) {
      ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(buttons_pad, 0.0f));
      if (ImGui::Button(Ui("Back", false).c_str(), ImVec2(bw, 0))) ToggleMenu();
      ImGui::SameLine();
@@ -657,10 +675,10 @@ index 5177717..ed5f118 100644
  void TapConfirm();             // a short press of A on the pad itself
  // a name being typed: the keys type (OnChar) and press nothing but the arrows and pause
 diff --git a/src/common/options.h b/src/common/options.h
-index 8c56e8b..ac9f923 100644
+index 8c56e8b..876f489 100644
 --- a/src/common/options.h
 +++ b/src/common/options.h
-@@ -26,10 +26,14 @@ struct Options {
+@@ -26,10 +26,15 @@ struct Options {
      uint32_t fov = 70;  // horizontal degrees on a 4:3 frame, 70 is the game's
      uint32_t viewmodel_fov = 70;  // the gun and arms, the same measure
      uint32_t walk_speed = 50;  // percent of running, while the walk key is held
@@ -668,6 +686,7 @@ index 8c56e8b..ac9f923 100644
      uint32_t audio_output = 0;  // audio::kOutputAuto, kOutputStereo, kOutputSurround or kOutputMono
      std::string language = "int";  // one of kLanguages
      bool smaa = false;  // over the finished frame, HUD included; combines with msaa
++    uint32_t sharpening = 0;  // percent, CAS over the finished frame after SMAA; 0 off
      bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
 +    uint32_t coop = 0;  // co-op: 0 off, 1 host, 2 join the host at join_ip; --coop host|join for one copy
 +    uint32_t coop_port = 45410;  // UDP, the host's
@@ -675,6 +694,129 @@ index 8c56e8b..ac9f923 100644
      std::map<std::string, std::string> keys;  // action id to key names, absent is the default
  };
  Options& Opt();
+diff --git a/src/d3d/d3d12.cpp b/src/d3d/d3d12.cpp
+index 4b9f9f5..7ff29e8 100644
+--- a/src/d3d/d3d12.cpp
++++ b/src/d3d/d3d12.cpp
+@@ -242,6 +242,35 @@ float4 smaa_blend(SmaaBlendV i) : SV_Target { return SMAANeighborhoodBlendingPS(
+ )";
+ constexpr int kSmaaTargets = 3;
+ 
++// AMD FidelityFX CAS (contrast adaptive sharpening, MIT): each pixel against its 3x3 neighbourhood, sharpened the
++// less the more contrast it already has, so edges don't ring. metrics: 1 / size, size; opts.x the sharpness 0..1
++const char* kCasHlsl = R"(
++cbuffer P : register(b1) { float4 metrics; float4 opts; };
++Texture2D tex0 : register(t0);
++struct V { float4 p : SV_Position; };
++V vs_full(uint id : SV_VertexID) {
++    V o;
++    float2 t = float2((id << 1) & 2, id & 2);
++    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
++    return o;
++}
++float3 at(int2 p) { return tex0.Load(int3(clamp(p, int2(0, 0), int2(metrics.zw) - 1), 0)).rgb; }
++float4 cas(V i) : SV_Target {
++    int2 p = int2(i.p.xy);
++    float3 a = at(p + int2(-1, -1)), b = at(p + int2(0, -1)), c = at(p + int2(1, -1));
++    float3 d = at(p + int2(-1, 0)), e = at(p), f = at(p + int2(1, 0));
++    float3 g = at(p + int2(-1, 1)), h = at(p + int2(0, 1)), k = at(p + int2(1, 1));
++    float3 mn = min(min(min(d, e), min(f, b)), h);
++    mn += min(mn, min(min(a, c), min(g, k)));
++    float3 mx = max(max(max(d, e), max(f, b)), h);
++    mx += max(mx, max(max(a, c), max(g, k)));
++    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));
++    float3 w = amp * (-1.0 / lerp(8.0, 5.0, saturate(opts.x)));
++    float3 o = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
++    return float4(saturate(o), tex0.Load(int3(p, 0)).a);
++}
++)";
++
+ // the output showing monitor mon, false when no adapter has it
+ bool FindOutput(IDXGIFactory4* factory, HMONITOR mon, DXGI_OUTPUT_DESC1& desc) {
+     ComPtr<IDXGIAdapter1> adapter;
+@@ -996,6 +1025,7 @@ private:
+     bool EnsureSmaaTargets(DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+     bool CreateSmaaTarget(int i, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+     bool DrawSmaaPasses(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h, const char* hlsl);
++    ID3D12Resource* Sharpen(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+     D3D12_CPU_DESCRIPTOR_HANDLE SmaaView(int i) {
+         return Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + i, rtv_inc_);
+     }
+@@ -1163,6 +1193,12 @@ private:
+     uint32_t smaa_w_ = 0;
+     uint32_t smaa_h_ = 0;
+     DXGI_FORMAT smaa_fmt_ = DXGI_FORMAT_UNKNOWN;
++    // sharpening (CAS): the sharpened frame, at the frame's size
++    ComPtr<ID3D12Resource> sharp_;
++    D3D12_RESOURCE_STATES sharp_state_ = {};
++    uint32_t sharp_w_ = 0;
++    uint32_t sharp_h_ = 0;
++    DXGI_FORMAT sharp_fmt_ = DXGI_FORMAT_UNKNOWN;
+     uint64_t presents_ = 0;
+     double fps_ = 0;
+     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
+@@ -1254,7 +1290,7 @@ uint32_t D3D12Backend::CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE t, uint32_t n, bool
+ 
+ // RTVs: the targets' pool, then the back buffers, the occlusion, output and SMAA targets
+ void D3D12Backend::CreateHeaps() {
+-    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets;
++    constexpr uint32_t kRtvTotal = kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets + 1;  // + sharpening
+     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
+     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
+     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvTotal, false, rtv_heap_);
+@@ -3340,9 +3376,40 @@ ID3D12Resource* D3D12Backend::PrepareShownFrame(Target* t) {
+     if (game::Opt().smaa) {
+         if (ID3D12Resource* aa = Smaa(r, t->fmt, t->w, t->h)) r = aa;
+     }
++    if (game::Opt().sharpening > 0) {
++        if (ID3D12Resource* s = Sharpen(r, t->fmt, t->w, t->h)) r = s;
++    }
+     return r;
+ }
+ 
++// src in the pixel shader resource state: CAS's sharpening of it, null when it can't run
++ID3D12Resource* D3D12Backend::Sharpen(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
++    D3D12_CPU_DESCRIPTOR_HANDLE view =
++        Cpu(rtv_heap_.Get(), kRtvCount + kFrames + kAoTargets + kOutTargets + kSmaaTargets, rtv_inc_);
++    if (!sharp_ || sharp_w_ != w || sharp_h_ != h || sharp_fmt_ != fmt) {
++        if (sharp_) Release(std::move(sharp_));
++        sharp_w_ = sharp_h_ = 0;
++        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
++        D3D12_RESOURCE_DESC td = Texture2DDesc(fmt, w, h);
++        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++        sharp_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, sharp_state_, nullptr,
++                                                 IID_PPV_ARGS(&sharp_)))) {
++            return nullptr;
++        }
++        dev_->CreateRenderTargetView(sharp_.Get(), nullptr, view);
++        sharp_w_ = w, sharp_h_ = h, sharp_fmt_ = fmt;
++        LOGI("d3d12: sharpening %ux%u", w, h);
++    }
++    float p[8] = {1.0f / w, 1.0f / h, float(w), float(h), float(game::Opt().sharpening) / 100.0f};
++    Transition(sharp_.Get(), sharp_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
++    ID3D12Resource* const in[3] = {src, nullptr, nullptr};
++    const DXGI_FORMAT in_fmt[3] = {fmt, fmt, fmt};
++    bool ok = Pass(kCasHlsl, "vs_full", "cas", fmt, view, w, h, in, in_fmt, p, -1);
++    Transition(sharp_.Get(), sharp_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    return ok ? sharp_.Get() : nullptr;
++}
++
+ // src in the pixel shader resource state: SMAA's blend of it, null when it can't run
+ ID3D12Resource* D3D12Backend::Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+     static const std::string hlsl = std::string(kSmaaConfig) + kSmaaHlsl + kSmaaPasses;
+@@ -3522,7 +3589,10 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* r, DXGI_FORMAT rtv) {
+     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
+     cl_->RSSetViewports(1, &vp);
+     cl_->RSSetScissorRects(1, &scissor);
+-    if (r) Blit(r, t.fmt, uv, {.gamma = gamma_, .rtv = rtv});
++    // rendered above the output (render resolution over 100%): each output pixel the mean of the n x n rendered
++    // ones under it, not the one bilinear sample at its centre (which skips rendered pixels between 100 and 200%)
++    uint32_t taps = vh > 0 && float(t.h) > vh * 1.01f ? std::min(4u, uint32_t(std::ceil(float(t.h) / vh))) : 1;
++    if (r) Blit(r, t.fmt, uv, {.gamma = gamma_, .taps = taps, .rtv = rtv});
+ }
+ 
+ void D3D12Backend::RenderUi() {
 diff --git a/src/game/ambient_occlusion.cpp b/src/game/ambient_occlusion.cpp
 index 575cf99..d1a085e 100644
 --- a/src/game/ambient_occlusion.cpp
