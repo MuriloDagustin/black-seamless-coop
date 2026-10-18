@@ -122,7 +122,9 @@ constexpr uint32_t kAiSquad = 0x22974;  // four characters, the player among the
 constexpr uint32_t kAiBehaviourPool = 0x22C48 + 0x7C; // pointers, used bytes, count; distinct from controllers/living list
 constexpr uint32_t kPoolTypes = 0x7A20;  // the character types of 0x40, +0 their model when loaded
 constexpr uint32_t kBodyName = 0xC0FFEE00, kBodyNameHi = 0x00C00B0D;
-constexpr uint32_t kBodyTypes[] = {0x1E, 0x1D, 0x1F, 0x25};  // the squad mates, a soldier: the first loaded
+// the squad mates, a soldier: the first loaded; then, for a mission with none of them (the last, 8), one of its own
+// soldiers' (an ally all the same: team 0)
+constexpr uint32_t kBodyTypes[] = {0x1E, 0x1D, 0x1F, 0x25, 0x24, 0x26, 0x27, 0x29, 0x2A, 0x28};
 constexpr uint64_t kBodyRetryMs = 2000;
 constexpr uint64_t kBodyGoneMs = 3000;  // the partner gone from this level that long (not paused in it): let go
 constexpr float kBodyRun = 6.5f;
